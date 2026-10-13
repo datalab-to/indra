@@ -26,6 +26,7 @@ Indra OCR is a 1M-parameter OCR model that reads 49 pages per second on 32 CPU c
 - Throughput - 49 pages/s on 32 x86 CPU cores (AMD EPYC), 11-17x Tesseract and PaddleOCR's PP-OCR text models on the same machine and pages ([table](#throughput))
 - Latency - ~230 ms per page on 4 x86 vCPUs, 12-24x faster than Tesseract and PaddleOCR's PP-OCR text models
 - Accuracy - scores 41.3 on [OmniParseBench](https://github.com/datalab-to/omni_parse_bench) text, ahead of PaddleOCR's PP-OCR text models (35.8) and Tesseract (19.3). Its headline score (62.1) beats PaddleOCR's full PP-StructureV3 pipeline (58.4).
+  - with `--math`: 66.8 headline and 57.5 text, ahead of PaddleOCR's PP-StructureV3 on every score ([Math](#math))
 - Layout and boxes - a bounding box for every line and every layout block, with block labels (headings, lists, tables, captions, footnotes, page headers) and reading order
 - Digital PDFs - reads the PDF's own text layer in any script, and OCRs only what the layer does not hold
 - Small - about 18 MB of models on ONNX Runtime, no PyTorch
@@ -194,16 +195,18 @@ Block labels: `Text`, `Section-Header`, `Page-Header`, `Page-Footer`, `List-Grou
 
 Math is off by default. With `--math` (or `indra_ocr.load(math=True)`), a small classifier finds the lines that hold math, and a second recognizer reads them as text with inline LaTeX (`we have $x _ { i } \leq 1$`). The main recognizer reads one symbol per column, so it cannot write a fraction or a sum with limits; the math recognizer decodes with attention, one token at a time. A reading replaces a line only when it holds math and its mean token probability is at least 0.9; otherwise the line keeps its text-layer or recognizer text.
 
-On OmniParseBench (all 2,937 pages, one page at a time on 1 thread of a GH200; without `--math` the same machine gives the 62.1 above):
+On OmniParseBench (all 2,937 pages, default settings otherwise):
 
-| | headline | text | tables | layout | math tests | median ms / page |
-|---|---|---|---|---|---|---|
-| Indra OCR | 62.1 | 41.4 | 56.4 | 88.5 | 14.3 | 421 |
-| Indra OCR `--math` | **66.8** | **57.5** | 54.8 | 88.1 | **56.5** | 873 |
+| | headline | text | tables | layout | math tests |
+|---|---|---|---|---|---|
+| Indra OCR | 62.1 | 41.4 | 56.4 | 88.5 | 14.3 |
+| Indra OCR `--math` | **66.8** | **57.5** | 54.8 | 88.1 | **56.5** |
+| PaddleOCR PP-StructureV3 | 58.4 | 55.6 | 47.8 | 71.7 | – |
 
-- Text passes PP-StructureV3 (55.6): the math tests were the whole gap.
+- With `--math`, Indra OCR is ahead of PaddleOCR's PP-StructureV3 on the headline, text, tables and layout. Without it, PP-StructureV3 leads on text.
 - Tables lose 1.5 points: numbers in some table cells are read as math.
-- Pages with math are slower: arXiv math pages take about 1.75 s instead of 0.16 s (median, 1 thread), since about half their lines go through the math recognizer.
+- `--math` is slower. On x86 (AMD EPYC Genoa), one page at a time on 4 cores in auto mode, the median page takes ~360 ms with `--math` and ~210 ms without. With one single-threaded worker per core, throughput is about 30% lower on 4 cores and 35% lower on 32 (4.8 vs 6.8 and 29.2 vs 44.9 pages/s, measured in one container on 300 OmniParseBench pages).
+- The cost falls on the pages where the math path runs. In auto mode, pages read through a digital PDF's text layer slow down most: their median time per page goes from 130 ms to 345 ms in the throughput run (one single-threaded worker per core).
 - Old scanned math gains little (22.2 to 23.1).
 
 The math models download only when `--math` is on.
@@ -218,17 +221,18 @@ The math models download only when `--math` is on.
 
 | engine | headline | text | tables | layout | median ms / page |
 |---|---|---|---|---|---|
-| Indra OCR (auto: text layer + OCR) | **62.1** | 41.3 | **56.4** | **88.6** | **228** |
+| Indra OCR (auto: text layer + OCR) | 62.1 | 41.3 | **56.4** | **88.6** | **228** |
 | Indra OCR (OCR only) | 57.5 | 33.5 | 50.9 | 88.2 | 303 |
+| Indra OCR `--math` (auto) | **66.8** | **57.5** | 54.8 | 88.1 | ~360† |
 | PaddleOCR PP-OCRv6 small, text models only (RapidOCR) | – | 35.8 | 0.0 | – | 2,685 |
-| PaddleOCR PP-StructureV3 (2,918 pages\*) | 58.4 | **55.6** | 47.8 | 71.7 | 40,958 |
+| PaddleOCR PP-StructureV3 (2,918 pages\*) | 58.4 | 55.6 | 47.8 | 71.7 | 40,958 |
 | Tesseract 5 (our run, Latin model) | – | 19.3 | 0.0 | – | 5,496 |
 
 - The PP-OCR text models and Tesseract output lines, not tables or layout blocks, so their table scores are 0 and their layout family is not scored.
-- PP-StructureV3 is PaddleOCR's full document pipeline (layout, tables, formulas). It reads text better than Indra OCR (55.6 vs 41.3), and it takes about 180 times as long per page. \*One of its 150 shards stalled for 6 hours on its first page, so its row leaves out 19 pages.
+- PP-StructureV3 is PaddleOCR's full document pipeline (layout, tables, formulas). Without `--math`, it reads text better than Indra OCR (55.6 vs 41.3). With `--math`, Indra OCR is ahead on text too (57.5). It takes about 180 times as long per page as Indra OCR's default mode. \*One of its 150 shards stalled for 6 hours on its first page, so its row leaves out 19 pages.
 - Faster settings exist, but we did not score their accuracy. Tesseract with the `eng` model and 1 thread takes 3.4 s a page (6.1 s as run). PP-StructureV3 without formula, seal and chart recognition, unwarping and orientation, and with its mobile OCR models, takes 10.5 s a page. Indra OCR is still 15-45x faster per page.
 - The OmniParseBench leaderboard's own Tesseract run scores 17.6 on text.
-- Median latency varies by about 15% between runs of the same code.
+- Median latency varies by about 15% between runs of the same code. †The `--math` latency is from a separate run on x86 (AMD EPYC Genoa, 4 cores, one page at a time), where the default mode gave 208 ms.
 
 **Chinese** (136 OmniParseBench Chinese tests): Indra OCR 64.7, PaddleOCR PP-OCRv5 mobile Chinese text models 65.4, PP-StructureV3 68.4.
 
@@ -253,11 +257,12 @@ Pages per second. Every engine ran on the same x86 machine (AMD EPYC, no GPU) on
 | engine | 4 cores | 8 cores | 16 cores | 32 cores |
 |---|---|---|---|---|
 | Indra OCR | **7.3** | **14.2** | **27.2** | **49.4** |
+| Indra OCR `--math`† | ~5 | – | – | ~30 |
 | PaddleOCR PP-OCRv6 small, text models only (RapidOCR) | 0.65 | 1.24 | 2.42 | 4.28 |
 | Tesseract 5 | 0.78 | 1.37 | 2.27 | 2.92 |
 | PaddleOCR PP-StructureV3\* | ≤ 0.022 | ≤ 0.044 | ≤ 0.089 | ≤ 0.18 |
 
-At 32 cores, Indra OCR is 11.5x PaddleOCR's PP-OCR text models, 16.9x Tesseract and about 280x PP-StructureV3 (against its upper bound). \*PP-StructureV3 ran a time-capped subset of the pages, so its numbers are upper bounds.
+At 32 cores, Indra OCR is 11.5x PaddleOCR's PP-OCR text models, 16.9x Tesseract and about 280x PP-StructureV3 (against its upper bound). \*PP-StructureV3 ran a time-capped subset of the pages, so its numbers are upper bounds. †`--math` ran in a separate container with the same CPU type and the same pages, where it gave 4.8 pages/s on 4 cores and 29.2 on 32, against 6.8 and 44.9 without it (about 30% and 35% lower).
 
 Model loading and one warm-up page per worker are not timed. A short 300-page job through `convert_many`, model loading included, runs at 7.2 pages/s on 4 cores and 37.7 on 32.
 
