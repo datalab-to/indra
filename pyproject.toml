@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "indra-ocr"
+version = "0.3.0"
+description = "Fast CPU OCR: line detection, CTC recognition, reading order and markdown, on ONNX Runtime"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "opencv-python-headless",
+  "onnxruntime",
+  "pypdfium2",
+  "huggingface_hub",
+]
+
+[project.optional-dependencies]
+tesseract = ["pytesseract"]
+test = ["pytest", "pillow", "pikepdf"]
+
+[project.scripts]
+indra-ocr = "indra_ocr.cli:main"
+indra-ocr-viewer = "indra_ocr.viewer:main"
+
+[tool.setuptools]
+packages = ["indra_ocr"]
