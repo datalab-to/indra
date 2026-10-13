@@ -297,7 +297,7 @@ On the OCR path, a page turned by a quarter or half turn is turned upright first
 | `mathcls.onnx` | does a line hold math? (`--math` only) | 0.2 MB |
 | `math_enc.onnx`, `math_dec_init.onnx`, `math_dec_step.onnx`, `math_meta.json` | math recognizer: line crop -> text with inline LaTeX (`--math` only) | 19.7 MB |
 
-`orient.onnx`, `script.onnx`, `rec_cjk.onnx` and `order.onnx` are optional: without them the pipeline skips that step. The Hugging Face repo tags each model set (`v1`, `v2`, `v3`, and `v3.1`: v3 plus the math models). `main` is the newest. See the [changelog](CHANGELOG.md) for what changed in each.
+`orient.onnx`, `script.onnx`, `rec_cjk.onnx` and `order.onnx` are optional: without them the pipeline skips that step. The Hugging Face repo tags each model set (`v1`, `v2`, `v3`, and `v3.1`: v3 plus the math models). This package downloads the `v3.1` set by default; pass `revision=` to `model_dir` to use another. See the [changelog](CHANGELOG.md) for what changed in each.
 
 # Credits
 

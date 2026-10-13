@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 
 HF_REPO = "datalab-to/indra-ocr"
+# Model set this package version was built and tested against (a tag in HF_REPO).
+HF_REVISION = "v3.1"
 FILES = ("det.onnx", "rec.onnx", "order.onnx", "meta.json")
 
 
@@ -38,7 +40,7 @@ def model_dir(
     return Path(
         snapshot_download(
             HF_REPO,
-            revision=revision,
+            revision=revision or HF_REVISION,
             allow_patterns=["*.onnx", "meta.json", *(MATH_FILES if math else ())],
             ignore_patterns=[] if math else list(MATH_FILES),
         )
