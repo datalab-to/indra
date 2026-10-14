@@ -78,22 +78,30 @@ def assign_runs(runs: list, boxes: np.ndarray, k: float) -> tuple[list[list], in
         return [], sum(not c.isspace() for r in runs for c, _ in r.chars)
     area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     for idx, run in enumerate(runs):
+        if not run.chars:
+            continue
+        # All of the run's characters against all boxes at once: the smallest
+        # box that contains each center (-1: none).
+        b = np.array([bx for _, bx in run.chars], float).reshape(-1, 4)
+        cx, cy = (b[:, 0] + b[:, 2]) / 2 * k, (b[:, 1] + b[:, 3]) / 2 * k
+        inside = (
+            (boxes[:, 0] <= cx[:, None])
+            & (cx[:, None] <= boxes[:, 2])
+            & (boxes[:, 1] <= cy[:, None])
+            & (cy[:, None] <= boxes[:, 3])
+        )
+        best = np.where(inside, area, np.inf).argmin(1)
+        best[~inside.any(1)] = -1
+        best = best.tolist()
         j = None
-        for c, b in run.chars:
+        for n, (c, _) in enumerate(run.chars):
             if not c.isspace():
-                cx, cy = (b[0] + b[2]) / 2 * k, (b[1] + b[3]) / 2 * k
-                inside = (
-                    (boxes[:, 0] <= cx)
-                    & (cx <= boxes[:, 2])
-                    & (boxes[:, 1] <= cy)
-                    & (cy <= boxes[:, 3])
-                )
-                if not inside.any():
+                if best[n] < 0:
                     lost += 1
                     j = None
                     continue
-                j = int(np.flatnonzero(inside)[np.argmin(area[inside])])
-                parts[j].setdefault(idx, []).append((c, cx, idx))
+                j = best[n]
+                parts[j].setdefault(idx, []).append((c, cx[n], idx))
             elif j is not None:
                 prev = parts[j][idx][-1]
                 parts[j][idx].append((c, prev[1], idx))
