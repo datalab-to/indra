@@ -92,7 +92,7 @@ For the latest code from GitHub instead: `pip install git+https://github.com/dat
 
 Python 3.10 or newer, tested on Linux (x86_64 and aarch64, Python 3.10 to 3.13) and macOS (Apple silicon). It installs ONNX Runtime, OpenCV and pypdfium2, and no PyTorch. The models download from Hugging Face on the first run and are cached. To use a local copy, set `INDRA_OCR_MODEL_DIR` or pass `--model-dir`.
 
-**Optional C++ kernels.** `pip install "indra-ocr[native]"` adds [`indra-ocr-native`](native/): compiled kernels for the recognizers' CTC head, the language-model beam search, the PDF text layer's per-character work, line splitting and block clustering. The results are the same: on all 2,937 OmniParseBench pages the scores, markdown, lines, boxes and blocks are unchanged (line confidences differ in the fourth decimal on about 1% of lines). Pages read about 1.2x faster, up to 1.7x for Chinese, Japanese and Korean scans and 1.3-1.9x for digital PDFs ([benchmarks](#native-kernels)). Without the package, or with `INDRA_OCR_NATIVE=0`, every step runs its Python code; if a kernel ever fails, that step runs its Python code and Indra warns once. `python -c "import indra_ocr.native as n; print(n.status())"` says whether they are on.
+**Optional C++ kernels.** `pip install "indra-ocr[native]"` adds [`indra-ocr-native`](native/): compiled kernels for the recognizers' CTC head, the language-model beam search, the PDF text layer's per-character work, line splitting and block clustering. The results are the same: on all 2,937 OmniParseBench pages the scores, markdown, lines, boxes and blocks are unchanged (line confidences differ in the fourth decimal on about 1% of lines). Pages read about 1.2x faster on one core: 1.4x for Chinese, Japanese and Korean scans, 1.3x for the Indic and Southeast Asian scripts ([benchmarks](#native-kernels)). Without the package, or with `INDRA_OCR_NATIVE=0`, every step runs its Python code; if a kernel ever fails, that step runs its Python code and Indra warns once. `python -c "import indra_ocr.native as n; print(n.status())"` says whether they are on.
 
 # Usage
 
@@ -325,18 +325,34 @@ Model loading and one warm-up page per worker are not timed.
 
 ## Native kernels
 
-`indra-ocr[native]` against the Python code, on all 2,937 OmniParseBench pages: `bench/opb_indra.py --dump` from the same code with and without the kernels, compared with `bench/compare_outputs.py`. One single-threaded worker per core on 6 cores of an Intel i7-13620H laptop (x86, AVX2).
+`indra-ocr[native]` against the Python code on OmniParseBench: one single-threaded worker per core on 6 cores of an Intel i7-13620H laptop (x86, AVX2).
 
-| run | headline | identical pages | median ms / page | mean ms / page |
-|---|---|---|---|---|
-| auto | 66.21, 66.21 | 2,937 of 2,937 | (paired, below) | (paired, below) |
-| OCR only | 61.29, 61.29 | 2,937 of 2,937 | 1,805 -> 1,448 | 2,263 -> 1,880 |
-| `--math` | 70.95, 70.95 | 2,936 of 2,937\* | 1,633 -> 1,373 | 3,498 -> 2,989 |
+**Same outputs.** All 2,937 pages through `bench/opb_indra.py --dump` with the original code and with the kernels, compared with `bench/compare_outputs.py`:
+
+| run | headline | text | tables | layout | identical pages |
+|---|---|---|---|---|---|
+| auto | 66.21, 66.21 | 46.83, 46.83 | 61.08, 61.08 | 90.72, 90.72 | 2,937 of 2,937 |
+| OCR only | 61.29, 61.29 | 40.79, 40.79 | 52.69, 52.69 | 90.39, 90.39 | 2,937 of 2,937 |
+| `--math` | 70.95, 70.95 | 62.76, 62.76 | 59.58, 59.58 | 90.51, 90.51 | 2,936 of 2,937\* |
 
 - Identical: the same markdown, line text and boxes, blocks, rotation and skew. Line confidences differ in the fourth decimal on 0.6% to 1.2% of lines: the CTC head sums its softmax in float32 in another order than ONNX Runtime does.
 - \*The one other page differs on its first read in a process, with or without the kernels: pdfium's character boxes change once it has rendered a page (it then measures glyph outlines rather than font metrics).
-- Throughput (`bench/throughput.py`, 300 pages, OCR mode): 2.66 -> 3.09 pages/s on 4 cores, 2.88 -> 3.49 on 6.
-- By page type, read with and without the kernels back to back on one core: 1.1-1.2x on Latin scans, where the recognizer's convolutions take most of the time; 1.5-1.7x on Chinese, Japanese and Korean scans, whose recognizer's 11,750-class head the kernels replace; 1.3-1.9x on digital PDFs, whose text layer was read character by character in Python.
+
+**Faster.** `bench/ab_latency.py` reads every page with and without the kernels back to back in the same worker (which goes first alternates), so drift of the machine falls on both alike:
+
+| pages | ms / page, Python | with the kernels | speedup of the mean | median page |
+|---|---|---|---|---|
+| all 2,937 (auto) | 1,376 | 1,184 | 1.16x | 1.19x |
+| scans (1,395) | 2,160 | 1,812 | 1.19x | 1.20x |
+| digital PDFs, text layer (1,123) | 572 | 523 | 1.09x | 1.18x |
+| text layer + OCR (419) | 921 | 864 | 1.07x | 1.18x |
+| Chinese, Japanese, Korean scans (65) | 2,469 | 1,711 | 1.44x | 1.50x |
+| Indic, Thai, Lao, Khmer, Armenian, Ethiopic scans (71) | 1,185 | 885 | 1.34x | 1.32x |
+| handwriting (209) | 1,546 | 1,275 | 1.21x | 1.20x |
+| 1,000 pages, OCR mode | 2,115 | 1,766 | 1.20x | 1.20x |
+
+- Throughput (`bench/throughput.py`, 300 pages, OCR mode, models loaded and a page read before the clock starts): 2.66 -> 3.09 pages/s on 4 cores, 2.88 -> 3.49 on 6.
+- The gain is largest where the kernels replace the most: the CJK recognizer's 11,750-class head, the other scripts' recognizer and language model. On Latin scans most of the time is the recognizer's convolutions, which the kernels do not change; on digital PDFs, the detector.
 
 ## Reproducing
 

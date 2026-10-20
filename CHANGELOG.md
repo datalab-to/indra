@@ -4,7 +4,7 @@
 
 Same models (Hugging Face tag `v1.1.0`).
 
-- **Optional C++ kernels** (`pip install "indra-ocr[native]"`, the new `indra-ocr-native` package in `native/`). The recognizers' CTC head, the language-model beam search, the PDF text layer's per-character work, line splitting and block clustering run in C++. On all 2,937 OmniParseBench pages the scores, markdown, lines, boxes and blocks are unchanged; pages read about 1.2x faster on one core (1.5-1.7x for Chinese, Japanese and Korean scans, 1.3-1.9x for digital PDFs). The recognizer graphs are cut at the CTC head when they load, so the models are unchanged.
+- **Optional C++ kernels** (`pip install "indra-ocr[native]"`, the new `indra-ocr-native` package in `native/`). The recognizers' CTC head, the language-model beam search, the PDF text layer's per-character work, line splitting and block clustering run in C++. On all 2,937 OmniParseBench pages the scores, markdown, lines, boxes and blocks are unchanged; pages read about 1.2x faster on one core (1.4x for Chinese, Japanese and Korean scans, 1.3x for the Indic and Southeast Asian scripts). The recognizer graphs are cut at the CTC head when they load, so the models are unchanged.
 - **The Python code stays.** Without the package, or with `INDRA_OCR_NATIVE=0`, every step runs as before. A kernel that raises falls back to the Python code for that call (with one warning); a recognizer whose cut graph fails reads with its full graph; when `convert_many`'s workers die, the rest is read without the kernels.
 - `bench/`: `opb_indra.py --dump` (page outputs) and `--pin` (worker per CPU), `compare_outputs.py` (two runs page by page), `throughput.py` (the throughput table) and `ab_latency.py` (with and without the kernels, paired page by page).
 
