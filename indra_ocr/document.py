@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import native
 from .pipeline import InputError, OrtOCR, Page, is_pdf, read_images
 from .textlayer import BROKEN_FONT_MAP, page_turn, read_text_layer, vertical_layout
 
@@ -112,6 +113,16 @@ def assign_runs(runs: list, boxes: np.ndarray, k: float) -> tuple[list[list], in
     lost = 0
     if not len(boxes):
         return [], sum(not c.isspace() for r in runs for c, _ in r.chars)
+    if native.lib is not None:
+        try:
+            n_lost = _assign_native(runs, boxes, k, parts)
+        except Exception as e:  # noqa: BLE001  (the loop below assigns them)
+            native.failed("assign_chars", e)
+            n_lost = None
+            for p in parts:  # start over from empty lines
+                p.clear()
+        if n_lost is not None:
+            lost, runs = n_lost, []  # assigned
     area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     for pos, run in enumerate(runs):
         idx = run.seq if run.seq is not None else pos
@@ -149,6 +160,39 @@ def assign_runs(runs: list, boxes: np.ndarray, k: float) -> tuple[list[list], in
             tk += line[idx]
         toks.append(tk)
     return toks, lost
+
+
+def _assign_native(runs: list, boxes: np.ndarray, k: float, parts: list) -> int | None:
+    """The loop of assign_runs with the native kernels: each character's line
+    and x come from C++ (the same tests in float64, the same smallest box), and
+    the tokens go into ``parts`` as the loop puts them.  Returns the lost count,
+    or None (``parts`` untouched) for runs the kernel does not take: runs
+    without their boxes array, or tokens that are not one character."""
+    if any(r.boxes is None or len(r.boxes) != len(r.chars) for r in runs):
+        return None
+    chars = [c for r in runs for c, _ in r.chars]
+    if not chars:
+        return 0
+    codes = np.frombuffer("".join(chars).encode("utf-32-le"), "<u4")
+    if len(codes) != len(chars):
+        return None
+    start = np.cumsum([0] + [len(r.chars) for r in runs], dtype=np.int64)
+    line_of, x_of, lost = native.lib.assign_chars(
+        codes,
+        np.ascontiguousarray(np.concatenate([r.boxes for r in runs]), np.float64),
+        start,
+        np.ascontiguousarray(boxes[:, :4], np.float32),
+        float(k),
+    )
+    line_of = line_of.tolist()
+    xs = list(x_of)  # float64 scalars, as the loop's centres are
+    for pos, run in enumerate(runs):
+        idx = run.seq if run.seq is not None else pos
+        for i in range(start[pos], start[pos + 1]):
+            j = line_of[i]
+            if j >= 0:
+                parts[j].setdefault(idx, []).append((chars[i], xs[i], idx))
+    return lost
 
 
 class Converter:

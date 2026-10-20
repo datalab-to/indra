@@ -19,10 +19,12 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Callable
 
 import cv2
 import numpy as np
 
+from . import native
 from .det_post import decode, page_to_input
 from .layout_post import page_blocks, page_markdown
 from .line_mask import crop_lines, line_darkness
@@ -214,6 +216,16 @@ def orient_input(gray: np.ndarray, side: int = ORIENT_SIDE) -> np.ndarray:
 
 
 @dataclass
+class CutGraph:
+    """A recognizer session cut at its CTC head (onnx_cut), for the native kernels."""
+
+    outputs: set  # the full graph's output names
+    topk: int  # classes per step in the full graph's top-k outputs
+    make_full: Callable[[], Any]  # the full graph's session, when a kernel fails
+    full: Any = None  # that session, once made
+
+
+@dataclass
 class Line:
     box: list[float]  # x0, y0, x1, y1 in image pixels
     text: str
@@ -299,13 +311,36 @@ class OrtOCR:
                 raise FileNotFoundError(p)
             return str(p)
 
+        # With the native kernels (and on the CPU), each recognizer graph is cut
+        # at its CTC head and ctc_greedy / ctc_topk read the logits (onnx_cut):
+        # id(session) -> CutGraph.  A graph that does not cut, or whose cut does
+        # not load, runs whole.
+        self._cut: dict = {}
+        cut_heads = native.lib is not None and prov == ["CPUExecutionProvider"]
+
+        def rec_session(path: str):
+            if cut_heads:
+                try:
+                    from .onnx_cut import cut_ctc_head
+
+                    cut = cut_ctc_head(Path(path).read_bytes())
+                    if cut is not None:
+                        sess = ort.InferenceSession(cut.model, so, providers=prov)
+                        self._cut[id(sess)] = CutGraph(
+                            set(cut.outputs),
+                            cut.topk,
+                            lambda: ort.InferenceSession(path, so, providers=prov),
+                        )
+                        return sess
+                except Exception as e:  # noqa: BLE001  (the full graph reads)
+                    native.failed("onnx_cut", e)
+            return ort.InferenceSession(path, so, providers=prov)
+
         if rec_int8 is None:
             rec_int8 = (onnx_dir / "rec.int8.onnx").exists()
         self.det = ort.InferenceSession(need("det.onnx"), so, providers=prov)
         self._pic = None  # the last page's picture channel, (logit map, scale)
-        self.rec = ort.InferenceSession(
-            need("rec.int8.onnx" if rec_int8 else "rec.onnx"), so, providers=prov
-        )
+        self.rec = rec_session(need("rec.int8.onnx" if rec_int8 else "rec.onnx"))
         self.mask = (
             ort.InferenceSession(str(onnx_dir / "mask.onnx"), so, providers=prov)
             if (onnx_dir / "mask.onnx").exists()
@@ -331,9 +366,7 @@ class OrtOCR:
         for g in [k[len("vocab_") :] for k in meta if k.startswith("vocab_")]:
             if (onnx_dir / f"rec_{g}.onnx").exists():
                 self.groups[g] = (
-                    ort.InferenceSession(
-                        str(onnx_dir / f"rec_{g}.onnx"), so, providers=prov
-                    ),
+                    rec_session(str(onnx_dir / f"rec_{g}.onnx")),
                     Vocab.from_json(meta[f"vocab_{g}"]),
                 )
         if self.groups and (onnx_dir / "script.onnx").exists():
@@ -359,7 +392,11 @@ class OrtOCR:
             (g, s) for g, (s, _) in self.groups.items()
         ]:
             f = onnx_dir / ("lm.npz" if name == "base" else f"lm_{name}.npz")
-            if f.exists() and set(OUT_LM) <= {o.name for o in sess.get_outputs()}:
+            cg = self._cut.get(id(sess))
+            outs = (
+                cg.outputs if cg is not None else {o.name for o in sess.get_outputs()}
+            )
+            if f.exists() and set(OUT_LM) <= outs:
                 from .lm import NgramLM
 
                 p = params.get(name, {})
@@ -466,11 +503,9 @@ class OrtOCR:
                 arr, widths = pad_batch([src[j] for j in idx])
                 lm = getattr(self, "lms", {}).get(id(sess))
                 use_lm = lm is not None
-                res = sess.run(
-                    OUT_GREEDY + (OUT_LM if use_lm else []),
-                    {"x": arr, "widths": widths},
+                best, pmax, lengths, lm_steps = self._read_batch(
+                    sess, arr, widths, use_lm
                 )
-                best, pmax, lengths = res[:3]
                 stride = arr.shape[-1] / max(best.shape[1], 1)
                 for k, j in enumerate(idx):
                     n = int(lengths[k])
@@ -487,10 +522,11 @@ class OrtOCR:
                     if use_lm and MIN_CONF <= conf < lm[3]:
                         from .lm import beam_search
 
+                        blank, topv, topi = lm_steps(k, n)
                         ids, steps = beam_search(
-                            res[3][k, :n],
-                            res[4][k, :n],
-                            res[5][k, :n],
+                            blank,
+                            topv,
+                            topi,
                             lm[0],
                             lm[1],
                             lm[2],
@@ -524,6 +560,52 @@ class OrtOCR:
                         xc = float(boxes[j, 0] + boxes[j, 2]) / 2
                         out[j] = (text, 1.0, [(text, xc)])
         return out
+
+    def _read_batch(self, sess, arr: np.ndarray, widths: np.ndarray, use_lm: bool):
+        """One batch through a recognizer: (best class per step [B, T], its
+        probability, lengths [B], lm_steps(k, n) -> (blank, topv, topi) of line
+        k's first n steps for the beam search).  A cut graph's logits go to the
+        native kernels; if the cut graph or a kernel fails, the full graph
+        reads the batch (made on first need), as without the kernels."""
+        feed = {"x": arr, "widths": widths}
+        cg = getattr(self, "_cut", {}).get(id(sess))
+        if cg is not None and native.lib is not None:
+            try:
+                logits, lengths = sess.run(None, feed)
+                best, pmax = native.lib.ctc_greedy(logits, lengths)
+            except Exception as e:  # noqa: BLE001  (the full graph reads the batch)
+                native.failed("ctc_greedy", e)
+            else:
+                whole: list = []  # the full graph's outputs, if ctc_topk fails
+
+                def lm_steps(k: int, n: int):
+                    if not whole and native.lib is not None:
+                        try:
+                            return native.lib.ctc_topk(logits[k], n, cg.topk)
+                        except Exception as e:  # noqa: BLE001
+                            native.failed("ctc_topk", e)
+                    if not whole:
+                        full = self._full_graph(cg)
+                        whole.append(full.run(OUT_GREEDY + OUT_LM, feed))
+                    r = whole[0]
+                    return r[3][k, :n], r[4][k, :n], r[5][k, :n]
+
+                return best, pmax, lengths, lm_steps
+        if cg is not None:
+            sess = self._full_graph(cg)
+        res = sess.run(OUT_GREEDY + (OUT_LM if use_lm else []), feed)
+
+        def lm_outputs(k: int, n: int):
+            return res[3][k, :n], res[4][k, :n], res[5][k, :n]
+
+        return res[0], res[1], res[2], lm_outputs
+
+    @staticmethod
+    def _full_graph(cg: "CutGraph"):
+        """The uncut graph of a cut recognizer (made once, on first need)."""
+        if cg.full is None:
+            cg.full = cg.make_full()
+        return cg.full
 
     def box_groups(self, gray: np.ndarray, boxes: np.ndarray) -> tuple[list[str], list[bool]]:
         """line_groups for line boxes on the page (crops as recognize makes them);
@@ -609,16 +691,28 @@ class OrtOCR:
         segs: list[list] = [[]]
         prev = None
         at = sorted(at or [])
-        for tk in toks:
-            x = tk[1]
-            if not self._is_space(tk[0]):
-                cut = prev is not None and (
-                    x - prev > gap * h or any(prev < c < x for c in at)
-                )
-                if cut:
-                    segs.append([])
-                prev = x
-            segs[-1].append(tk)
+        cuts = None
+        if native.lib is not None and isinstance(toks, list):
+            # the same cuts, found in C++: the tokens that start a new segment
+            try:
+                space = self.vocab.index.get(" ")
+                cuts = native.lib.split_points(toks, gap * h, at, space)
+            except Exception as e:  # noqa: BLE001  (the loop below finds them)
+                native.failed("split_points", e)
+        if cuts is not None:
+            bounds = [0, *cuts, len(toks)]
+            segs = [toks[a:b] for a, b in zip(bounds, bounds[1:])]
+        else:
+            for tk in toks:
+                x = tk[1]
+                if not self._is_space(tk[0]):
+                    cut = prev is not None and (
+                        x - prev > gap * h or any(prev < c < x for c in at)
+                    )
+                    if cut:
+                        segs.append([])
+                    prev = x
+                segs[-1].append(tk)
         if len(segs) == 1:
             return [(list(box[:4]), self._decode(toks), toks)]
         out = []

@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import native
+
 MAX_INVISIBLE_FRAC = 0.05
 MAX_BAD_CHAR_FRAC = 0.005
 MAX_NO_INK_LINE_FRAC = 0.03
@@ -58,6 +60,7 @@ class TextLine:
     chars: list = field(default_factory=list)  # (char, bbox) in PDF order
     quarter: int = 0  # quarter turns from upright in the (turned) frame
     seq: int | None = None  # position in the page's content order (all runs)
+    boxes: np.ndarray | None = None  # the chars' boxes [n, 4] (for the native kernels)
 
 
 @dataclass
@@ -166,15 +169,25 @@ def extract_runs(
         # character (a page has few distinct ones).
         get_unicode, get_angle = R.FPDFText_GetUnicode, R.FPDFText_GetCharAngle
         get_box, raw_tp = R.FPDFText_GetCharBox, tp.raw
+        fast = None
+        if native.lib is not None:
+            try:
+                fast = _native_chars(tp, n, L, turn)
+            except Exception as e:  # noqa: BLE001  (the loop below runs instead)
+                native.failed("pdf_chars", e)
+        if fast is not None:
+            chars, raw, breaks, qs, n_chars, n_rot, n_bad, quarters = fast
+            n = 0  # the loop below has nothing left to do
+        else:
+            chars, raw, breaks = [], [], []  # breaks: run ends after these positions
+            qs: list = []  # each character's quarter turn relative to ``turn``
+            n_chars = n_rot = n_bad = 0
+            quarters = [0, 0, 0, 0]
         bl, br, bb, bt = (ctypes.c_double() for _ in range(4))
         pl, pr, pb, pt = (ctypes.byref(v) for v in (bl, br, bb, bt))
         upright: dict = {}
-        quarters = [0, 0, 0, 0]
         bad: dict = {}
-        chars, raw, breaks = [], [], []  # breaks: run ends after these positions
-        qs: list = []  # each character's quarter turn relative to ``turn``
         cur_q = 0
-        n_chars = n_rot = n_bad = 0
         low = False  # this index is the second half of a surrogate pair
         for i in range(n):
             if low:
@@ -258,7 +271,8 @@ def extract_runs(
     cuts = sorted(set(breaks + turns + [len(chars)]))
     start = 0
     for end in cuts:
-        seg = [(chars[i], tuple(boxes[i])) for i in range(start, end) if visible[i]]
+        sel = [i for i in range(start, end) if visible[i]]
+        seg = [(chars[i], tuple(boxes[i])) for i in sel]
         q = qs[start] if start < len(qs) else 0
         start = end
         ink = [bx for c, bx in seg if not c.isspace()]
@@ -279,8 +293,47 @@ def extract_runs(
             dy = abs(c0[-1][1] - c0[0][1])
             if dy > 2 * dx:
                 q = 1
-        runs.append(TextLine(box, text, seg, q, len(runs)))
+        runs.append(TextLine(box, text, seg, q, len(runs), boxes[sel]))
     return runs, stats
+
+
+def _native_chars(tp, n: int, L: np.ndarray, turn: int):
+    """extract_runs' character loop with the native kernels: pdfium's calls and
+    the loop run in C++, and the upright test runs here once per distinct angle.
+    Returns (chars, boxes [k, 4] as l, b, r, t, breaks, quarter turns, characters,
+    turned characters, bad characters, characters per quarter turn), or None
+    when anything is off: the Python loop then runs (and raises as it does)."""
+    import ctypes
+
+    import pypdfium2.raw as R
+
+    def addr(obj) -> int:
+        return ctypes.cast(obj, ctypes.c_void_p).value or 0
+
+    codes, angles, cbox, ok = native.lib.pdf_char_data(
+        addr(tp.raw),
+        n,
+        addr(R.FPDFText_GetUnicode),
+        addr(R.FPDFText_GetCharAngle),
+        addr(R.FPDFText_GetCharBox),
+    )
+    ua, inv = np.unique(angles, return_inverse=True)
+    qmap = np.empty(len(ua), np.int8)
+    for j, a in enumerate(ua.tolist()):
+        try:
+            q = _quarter(L @ np.array([math.cos(a), math.sin(a)]))
+        except (ValueError, OverflowError):  # a NaN angle
+            return None
+        qmap[j] = -1 if q is None else q
+    chars, qs, src, breaks, counted, n_chars, n_rot, quarters, err = (
+        native.lib.pdf_char_loop(codes, qmap[inv.reshape(-1)], ok, turn)
+    )
+    if err:
+        return None
+    u, cnt = np.unique(counted, return_counts=True)
+    n_bad = sum(bad_char_count(chr(c)) * k for c, k in zip(u.tolist(), cnt.tolist()))
+    text = chars.astype("<u4").tobytes().decode("utf-32-le")
+    return list(text), cbox[src], breaks, qs.tolist(), n_chars, n_rot, n_bad, quarters
 
 
 def visual_rtl_frac(runs: list[TextLine]) -> tuple[int, float]:

@@ -26,6 +26,8 @@ Changelog = "https://github.com/datalab-to/indra/blob/main/CHANGELOG.md"
 Issues = "https://github.com/datalab-to/indra/issues"
 
 [project.optional-dependencies]
+# C++ kernels for the hot loops (native/); without them the same steps run as Python
+native = ["indra-ocr-native>=0.1.0"]
 tesseract = ["pytesseract"]
 test = ["pytest", "pillow", "pikepdf"]
 

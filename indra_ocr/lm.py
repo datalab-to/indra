@@ -20,6 +20,8 @@ import math
 
 import numpy as np
 
+from . import native
+
 BITS = 11  # per token, unless lm.npz holds "bits"
 TAG_SHIFT = 61  # the history length goes in the top 3 bits
 BOS = -1
@@ -60,6 +62,26 @@ class NgramLM:
         self._masks = ((np.uint64(1) << (np.uint64(self.bits) * n)) - np.uint64(1))[
             None, :
         ]
+        self._native = None  # the C++ model over the same tables, made on first use
+
+    def __getstate__(self) -> dict:
+        # the native model points into this process's tables: rebuilt on demand
+        return {**self.__dict__, "_native": None}
+
+    def native_lm(self):
+        """The native kernels' NgramLM over these tables (same values as logp_keys)."""
+        if self._native is None:
+            self._native = native.lib.NgramLM(
+                self.order,
+                self.bits,
+                self.vocab_size,
+                self.p_keys,
+                self.p_vals,
+                self.h_keys,
+                self.h_vals,
+                self.max_logp,
+            )
+        return self._native
 
     @property
     def max_logp(self) -> float:
@@ -175,7 +197,23 @@ def beam_search(
     log-probabilities; topv / topi: [T, k] the k best classes per step (blank
     included) and their log-probabilities; a class under ``cand_floor``
     probability at a step is not tried there.  Returns (token ids, the step
-    where each token was first emitted)."""
+    where each token was first emitted).  With the native kernels the same
+    search runs in C++ (same result: the same float64 steps and tie order)."""
+    if native.lib is not None and isinstance(lm, NgramLM):
+        try:
+            return native.lib.beam_search(
+                np.ascontiguousarray(blank, np.float32),
+                np.ascontiguousarray(topv, np.float32),
+                np.ascontiguousarray(topi, np.int64),
+                lm.native_lm(),
+                alpha,
+                beta,
+                beam,
+                blank_skip,
+                cand_floor,
+            )
+        except Exception as e:  # noqa: BLE001  (the search below runs instead)
+            native.failed("beam_search", e)
     bits = lm.bits
     hmask = (1 << (bits * (lm.order - 1))) - 1
     # prefix -> (log p ending in blank, log p ending in non-blank, lm score,

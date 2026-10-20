@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import native
 from .pipeline import InputError, Page, is_pdf
 
 THREADS_PER_WORKER = 1  # ORT threads in each worker process
@@ -201,12 +202,16 @@ def _pooled(paths, plan, workers, max_pages, password, cores, load_kwargs: dict)
         warnings.warn(
             "indra_ocr.convert_many: the worker processes stopped (with the spawn "
             'start method, call convert_many under `if __name__ == "__main__":`); '
-            "reading the remaining inputs in this process",
+            "reading the remaining inputs in this process"
+            + (", without the native kernels" if native.lib is not None else ""),
             RuntimeWarning,
             stacklevel=2,
         )
-        yield from _serial(
-            paths[done:], plan[done:], max_pages, password, cores, load_kwargs
-        )
+        # A worker that crashed may have crashed in a kernel: the rest runs as
+        # Python code, so this process cannot crash the same way.
+        with native.disabled():
+            yield from _serial(
+                paths[done:], plan[done:], max_pages, password, cores, load_kwargs
+            )
     finally:
         ex.shutdown(wait=False, cancel_futures=True)

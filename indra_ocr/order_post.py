@@ -11,6 +11,8 @@ import unicodedata
 
 import numpy as np
 
+from . import native
+
 N_GEOM = 10
 N_TEXT = 6
 N_FEATS = N_GEOM + N_TEXT
@@ -270,10 +272,16 @@ def _cluster(logits: np.ndarray) -> list[list[int]]:
 
     A merge changes only the merged group's row and column of the mean matrix,
     and each row keeps its best partner, so a page of n lines costs about n^2
-    instead of n^3 (an 800-line page: 1.5 s -> tens of ms)."""
+    instead of n^3 (an 800-line page: 1.5 s -> tens of ms).  With the native
+    kernels the same steps run in C++ (same groups)."""
     n = logits.shape[0]
     if n == 0:
         return []
+    if native.lib is not None:
+        try:
+            return native.lib.cluster(np.ascontiguousarray(logits, np.float64))
+        except Exception as e:  # noqa: BLE001  (the loop below runs instead)
+            native.failed("cluster", e)
     S = logits.astype(np.float64).copy()
     np.fill_diagonal(S, 0.0)
     size = np.ones(n)
