@@ -1,0 +1,23 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "indra-ocr-native"
+version = "0.1.0"
+description = "Optional C++ kernels for Indra OCR: install with pip install \"indra-ocr[native]\""
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.urls]
+Repository = "https://github.com/datalab-to/indra"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+cmake.build-type = "Release"
+wheel.packages = ["src/indra_ocr_native"]
+# One stable-ABI wheel covers Python 3.12 and newer; 3.10 and 3.11 get their own.
+wheel.py-api = "cp312"

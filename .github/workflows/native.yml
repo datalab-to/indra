@@ -1,0 +1,91 @@
+# The optional C++ kernels (indra-ocr-native, in native/): wheels for Linux (x86_64,
+# aarch64), macOS (Apple silicon) and Windows, each tested with the full test suite
+# (the native tests compare every kernel with the Python code). A tag native-v0.1.0
+# publishes them; the tag must match native/pyproject.toml. Pull requests that touch
+# the kernels or the code that calls them build and test without publishing.
+#
+# Publishing uses PyPI Trusted Publishing: the indra-ocr-native project on PyPI must
+# trust this repository, this workflow file and the environment below.
+name: native
+
+on:
+  push:
+    tags: ["native-v*"]
+  pull_request:
+    paths: ["native/**", "indra_ocr/**", "tests/**", ".github/workflows/native.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag against the declared version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          declared=$(python -c 'import tomllib; print(tomllib.load(open("native/pyproject.toml","rb"))["project"]["version"])')
+          tag=${GITHUB_REF_NAME#native-v}
+          if [ "$declared" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $declared in native/pyproject.toml" >&2
+            exit 1
+          fi
+
+      - name: Build and test the wheels
+        shell: bash
+        run: |
+          python -m pip install "cibuildwheel>=3,<4"
+          python -m cibuildwheel native --output-dir wheelhouse
+        env:
+          # 3.10 and 3.11 get their own wheels; one stable-ABI wheel covers 3.12+.
+          CIBW_BUILD: "cp310-* cp311-* cp312-*"
+          CIBW_SKIP: "*-musllinux_* *-win32 *_i686"
+          CIBW_ARCHS_MACOS: arm64
+          CIBW_TEST_REQUIRES: pytest pillow pikepdf
+          # the package from this checkout, then every test: the native ones
+          # compare each kernel with the Python code it replaces
+          CIBW_TEST_COMMAND: >-
+            pip install {project} &&
+            python -c "import indra_ocr.native as n; assert n.lib is not None, n.status(); print(n.status())" &&
+            pytest -q {project}/tests
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build --sdist native --out-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/native-v')
+    environment: pypi-native
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
