@@ -62,6 +62,17 @@ void ctc_greedy(const float* logits, int B, int V, int T,
 void ctc_topk(const float* logits, int V, int T, int n, int K, float* blank,
               float* topv, int64_t* topi);
 
+// ctc_hwy.cpp: per step of a tile [w steps] of rows of stride T, the max logit
+// m, its class am (first on ties) and s = sum exp(x - m), with the best SIMD
+// target of this CPU.
+void tile_stats(const float* L, int V, int T, int w, float* m, int32_t* am, float* s);
+// The SIMD target tile_stats runs with (Highway's name: AVX2, AVX3, NEON, ...),
+// the ones this build and CPU have, and a testing hook that forces one
+// ("best" undoes it; not while kernels run on other threads).
+std::string ctc_isa();
+std::vector<std::string> ctc_isas();
+void set_ctc_isa(const std::string& name);
+
 // ------------------------------------------------------------ language model
 
 // lm.NgramLM over its sorted tables (owned by the Python object).

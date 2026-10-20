@@ -68,6 +68,27 @@ def test_ctc_greedy_matches_softmax_argmax():
         assert np.allclose(conf, rconf, rtol=2e-5, atol=1e-7)
 
 
+def test_every_simd_target_reads_the_same(monkeypatch):
+    """Each SIMD target this build and CPU have (Highway's run-time dispatch):
+    the same classes, probabilities within float32 rounding."""
+    rng = np.random.default_rng(8)
+    logits = (rng.standard_normal((3, 2936, 61)) * 6).astype(np.float32)
+    logits[1] = np.round(logits[1])  # ties
+    lengths = np.array([61, 40, 17], np.int64)
+    rids, rconf = _greedy_ref(logits, lengths)
+    targets = nat.ctc_isas()
+    assert targets and nat.ctc_isa() in targets
+    try:
+        for name in targets:
+            nat.set_ctc_isa(name)
+            assert nat.ctc_isa() == name
+            ids, conf = nat.ctc_greedy(logits, lengths)
+            assert (ids == rids).all(), name
+            assert np.allclose(conf, rconf, rtol=2e-5, atol=1e-7), name
+    finally:
+        nat.set_ctc_isa("best")
+
+
 def test_ctc_topk_matches_log_softmax_topk():
     rng = np.random.default_rng(1)
     V, T, n, K = 300, 50, 37, 8

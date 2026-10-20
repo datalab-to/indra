@@ -8,6 +8,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
@@ -58,6 +59,13 @@ struct PyNgramLM {
 
 NB_MODULE(_core, m) {
   m.attr("API") = API;
+  indra::ctc_isa();  // picks the SIMD target once, before any thread asks
+
+  m.def("ctc_isa", &indra::ctc_isa, "The SIMD target of the CTC head (AVX2, AVX3, NEON, ...).");
+  m.def("ctc_isas", &indra::ctc_isas, "The SIMD targets this build and CPU have.");
+  m.def("set_ctc_isa", &indra::set_ctc_isa, "name"_a,
+        "Testing hook: run the CTC head with one target (\"best\" undoes it); not while "
+        "kernels run on other threads.");
 
   m.def(
       "is_space", [](uint32_t c) { return indra::is_space(c); }, "c"_a,

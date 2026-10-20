@@ -31,6 +31,8 @@ def test_ctc_kernels_check_their_input():
         nat.ctc_topk(np.zeros((0, 5), np.float32), 5, 2)
     with pytest.raises(TypeError):
         nat.ctc_greedy(np.zeros((2, 3), np.float32), np.array([1, 1]))  # not 3-D
+    with pytest.raises(ValueError):
+        nat.set_ctc_isa("no such target")
     # lengths out of range are clamped, not followed
     ids, conf = nat.ctc_greedy(np.ones((2, 3, 4), np.float32), np.array([-7, 1 << 40]))
     assert ids.shape == (2, 4) and (conf[0] == 0).all() and (conf[1] > 0).all()

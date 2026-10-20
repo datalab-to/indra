@@ -11,12 +11,15 @@ from ._core import (  # noqa: F401
     beam_search,
     cluster,
     ctc_greedy,
+    ctc_isa,
+    ctc_isas,
     ctc_topk,
     is_space,
     pdf_char_data,
     pdf_char_loop,
     NgramLM,
+    set_ctc_isa,
     split_points,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

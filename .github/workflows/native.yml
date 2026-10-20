@@ -54,10 +54,11 @@ jobs:
           CIBW_ARCHS_MACOS: arm64
           CIBW_TEST_REQUIRES: pytest pillow pikepdf
           # the package from this checkout, then every test: the native ones
-          # compare each kernel with the Python code it replaces
+          # compare each kernel (every SIMD target the runner has) with the
+          # Python code it replaces
           CIBW_TEST_COMMAND: >-
             pip install {project} &&
-            python -c "import indra_ocr.native as n; assert n.lib is not None, n.status(); print(n.status())" &&
+            python -c "import indra_ocr.native as n; assert n.lib is not None, n.status(); print(n.status(), n.lib.ctc_isas())" &&
             pytest -q {project}/tests
 
       - uses: actions/upload-artifact@v4

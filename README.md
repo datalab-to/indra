@@ -354,6 +354,18 @@ Model loading and one warm-up page per worker are not timed.
 - Throughput (`bench/throughput.py`, 300 pages, OCR mode, models loaded and a page read before the clock starts): 2.66 -> 3.09 pages/s on 4 cores, 2.88 -> 3.49 on 6.
 - The gain is largest where the kernels replace the most: the CJK recognizer's 11,750-class head, the other scripts' recognizer and language model. On Latin scans most of the time is the recognizer's convolutions, which the kernels do not change; on digital PDFs, the detector.
 
+**indra-ocr-native 0.2** writes the CTC head with [Google Highway](https://github.com/google/highway), which picks the CPU's best SIMD target at run time (AVX2 here; 0.1 had hand-written SSE2 code, for x86 only). On the same recognizer logits, one core, the head is 1.4-1.5x faster: 65 -> 43 ms (Latin), 116 -> 85 ms (CJK), 30 -> 20 ms (other scripts). It is a small part of a page, though. `bench/ab_builds.py` reads the same pages with both builds, in turns:
+
+| pages | ms / page, 0.1 | 0.2 | speedup of the mean | median page |
+|---|---|---|---|---|
+| one worker on an idle core, 300 pages | 633 | 615 | 1.03x | 1.00x |
+| one worker, Chinese, Japanese, Korean scans (33) | 603 | 592 | 1.02x | 1.02x |
+| one worker, Indic, Southeast Asian, Georgian, Armenian, Ethiopic scans (74) | 390 | 379 | 1.03x | 1.02x |
+| six workers, all 2,937 pages | 1,048 | 1,050 | 1.00x | 1.03x |
+
+- The outputs are the same on every page. Throughput (300 pages, OCR mode, 6 cores, four runs each) is 3.44-3.48 pages/s with 0.1 and 3.40-3.48 with 0.2.
+- With six workers, groups of pages moved by up to 10% either way between the two builds, text-layer pages too, which barely run the head: what the other workers read at the time, and the run's tail, weigh more than the head, so a per-page comparison needs one worker on an idle core.
+
 ## Reproducing
 
 ```shell
@@ -372,3 +384,4 @@ Thank you to the following open source projects:
 - [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
 - [OpenCV](https://github.com/opencv/opencv)
 - [Hugging Face Hub](https://github.com/huggingface/huggingface_hub)
+- [Google Highway](https://github.com/google/highway) (in `indra-ocr-native`)

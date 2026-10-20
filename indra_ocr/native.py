@@ -90,9 +90,10 @@ def disabled():
 def status() -> str:
     """Whether the kernels are on, and why not (one line)."""
     if lib is not None:
-        return (
-            f"native kernels on (indra-ocr-native {getattr(lib, '__version__', '?')})"
-        )
+        extras = [f"indra-ocr-native {getattr(lib, '__version__', '?')}"]
+        if hasattr(lib, "ctc_isa"):
+            extras.append(lib.ctc_isa())  # the SIMD target of the CTC head
+        return f"native kernels on ({', '.join(extras)})"
     if os.environ.get("INDRA_OCR_NATIVE", "").strip() == "0":
         return "native kernels off (INDRA_OCR_NATIVE=0)"
     return 'native kernels off (pip install "indra-ocr[native]")'

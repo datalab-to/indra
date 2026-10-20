@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "indra-ocr-native"
-version = "0.1.0"
+version = "0.2.0"
 description = "Optional C++ kernels for Indra OCR: install with pip install \"indra-ocr[native]\""
 readme = "README.md"
 license = "Apache-2.0"
