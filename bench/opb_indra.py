@@ -10,7 +10,10 @@ markdown does, and the layout blocks map onto the benchmark's labels.  Latency
 is the converter's wall time per page, page loading included.
 
 Writes summary.json (the benchmark's summarize) and pages.jsonl (per page:
-latency, source, verdict counts).
+latency, source, verdict counts).  --dump also writes outputs.jsonl (per page:
+markdown, lines, blocks, rotation, skew), to compare two runs page by page
+(bench/compare_outputs.py).  --pin 0,2,4 pins worker k to CPU k (needs psutil):
+steadier latency on machines with mixed core types.
 """
 
 from __future__ import annotations
@@ -38,11 +41,18 @@ _CONV = None
 _ARGS: dict = {}
 
 
-def init(args: dict) -> None:
+def init(args: dict, slot=None) -> None:
     global _CONV, _ARGS
     import indra_ocr
 
     _ARGS = args
+    if args.get("pin") and slot is not None:
+        import psutil
+
+        with slot.get_lock():
+            k = slot.value
+            slot.value += 1
+        psutil.Process().cpu_affinity([args["pin"][k % len(args["pin"])]])
     _CONV = indra_ocr.load(
         args["models"],
         threads=1,
@@ -98,13 +108,25 @@ def run_page(item: tuple[str, str]) -> dict:
         ms = 1000 * (time.perf_counter() - t0)
         verdicts = score(outputs_of(page, w, h), tests)
         source = page.source
+        out = {
+            "markdown": page.markdown,
+            "lines": [[ln.box, ln.text, ln.conf] for ln in page.lines],
+            "blocks": page.blocks,
+            "rotation": page.rotation,
+            "skew": page.skew,
+            "source": page.source,
+        }
     except Exception as e:  # noqa: BLE001  (a failed page fails its tests, it does not stop the run)
         ms, source = (
             1000 * (time.perf_counter() - t0),
             f"error: {type(e).__name__}: {e}",
         )
         verdicts = score({}, tests)
-    return {"page_id": page_id, "ms": ms, "source": source, "verdicts": verdicts}
+        out = {"error": source}
+    r = {"page_id": page_id, "ms": ms, "source": source, "verdicts": verdicts}
+    if _ARGS.get("dump"):
+        r["out"] = out
+    return r
 
 
 def main():
@@ -125,20 +147,35 @@ def main():
         "--suites", default="", help="comma-separated suites (default: all)"
     )
     ap.add_argument("--math", action="store_true", help="write math as LaTeX")
+    ap.add_argument(
+        "--dump", action="store_true", help="also write outputs.jsonl (page outputs)"
+    )
+    ap.add_argument(
+        "--pin", default="", help="comma-separated CPUs, worker k on CPU k (psutil)"
+    )
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     root, pages, by_page = benchmark.load(a.dataset)
     keep = set(a.suites.split(",")) if a.suites else None
     pages = [p for p in pages if keep is None or p.suite in keep][: a.limit or None]
     items = [(p.page_id, p.doc_path) for p in pages]
-    args = {"models": a.models, "mode": a.mode, "dataset": a.dataset, "math": a.math}
+    args = {
+        "models": a.models,
+        "mode": a.mode,
+        "dataset": a.dataset,
+        "math": a.math,
+        "dump": a.dump,
+        "pin": [int(c) for c in a.pin.split(",")] if a.pin else [],
+    }
+    ctx = mp.get_context("spawn")
     t0 = time.time()
-    rows, verdicts = [], []
-    with mp.get_context("spawn").Pool(
-        a.procs, initializer=init, initargs=(args,)
-    ) as pool:
+    rows, verdicts, dumps = [], [], []
+    slot = ctx.Value("i", 0)  # the next worker's place in --pin
+    with ctx.Pool(a.procs, initializer=init, initargs=(args, slot)) as pool:
         for k, r in enumerate(pool.imap_unordered(run_page, items, chunksize=4), 1):
             verdicts += r["verdicts"]
+            if a.dump:
+                dumps.append({"page_id": r["page_id"], **r["out"]})
             rows.append(
                 {
                     "page_id": r["page_id"],
@@ -167,6 +204,10 @@ def main():
     with open(a.out / "pages.jsonl", "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
+    if a.dump:
+        with open(a.out / "outputs.jsonl", "w", encoding="utf-8") as f:
+            for d in sorted(dumps, key=lambda d: d["page_id"]):
+                f.write(json.dumps(d, ensure_ascii=False) + "\n")
     print(
         json.dumps(
             {"headline": summary["headline"], **summary["indra_ocr"]},
