@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.3
+
+Same models (Hugging Face tag `v1.1.0`).
+
+- **Turning math on after a run without it.** The models download on demand, and a
+  first run without `--math` leaves the math models out of the cached snapshot. That
+  folder was then trusted for every later run, so turning math on failed with
+  `FileNotFoundError: math=True needs the math models in ...`, and retrying never
+  recovered (the cached folder is returned before the download is attempted). The
+  cached folder is now checked for the files the run needs, the download completes
+  it, and a folder that still lacks them raises a `ModelError` naming them
+  ([#18](https://github.com/datalab-to/indra/issues/18)).
+
 ## 1.1.2
 
 Same models (Hugging Face tag `v1.1.0`).

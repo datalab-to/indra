@@ -152,6 +152,51 @@ def test_model_errors_are_one_clear_message(tmp_path, monkeypatch, capsys):
     )
 
 
+def test_model_dir_completes_a_cache_primed_without_math(tmp_path, monkeypatch):
+    """A non-math run leaves the math models out of the cached snapshot (they are
+    downloaded only when math is on): that folder must not be trusted for a later
+    math=True call, which has to complete it."""
+    import huggingface_hub
+
+    from indra_ocr.models import FILES, MATH_FILES, model_dir
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    for name in (*FILES[:2], "meta.json"):  # what a non-math run downloads
+        (snap / name).touch()
+
+    calls = []
+
+    def fake(repo_id, *, local_files_only=False, **kw):
+        calls.append(local_files_only)
+        if not local_files_only:  # the real call would fetch the math models
+            for name in MATH_FILES:
+                (snap / name).touch()
+        return str(snap)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake)
+    monkeypatch.delenv("INDRA_OCR_MODEL_DIR", raising=False)
+    assert model_dir(math=True) == snap
+    assert calls == [True, False]  # the partial cached folder was not returned
+
+
+def test_model_dir_names_the_files_a_partial_cache_lacks(tmp_path, monkeypatch):
+    """A cached folder that stays incomplete is reported, not handed on."""
+    import huggingface_hub
+
+    from indra_ocr import ModelError
+    from indra_ocr.models import model_dir
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    for name in ("det.onnx", "rec.onnx", "meta.json"):
+        (snap / name).touch()
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(snap))
+    monkeypatch.delenv("INDRA_OCR_MODEL_DIR", raising=False)
+    with pytest.raises(ModelError, match="lacks mathcls.onnx"):
+        model_dir(math=True)
+
+
 def test_version_flag(capsys):
     from indra_ocr import __version__
     from indra_ocr.cli import main

@@ -58,14 +58,21 @@ def model_dir(
         ],
         ignore_patterns=[] if math else list(MATH_FILES),
     )
+    # The files this call must leave behind.  A cached snapshot can be partial:
+    # a first run without math downloads no math models, and huggingface_hub
+    # only notices on its own when the cache carries a tree index (it does not
+    # for a cache built by an older version), so check the folder here.
+    need = (*FILES[:2], "meta.json", *(MATH_FILES if math else ()))
     try:
         # A tag's files never change: a cached copy needs no network (and no
         # progress bar on every run).
-        return Path(snapshot_download(HF_REPO, local_files_only=True, **kw))
+        cached = Path(snapshot_download(HF_REPO, local_files_only=True, **kw))
+        if all((cached / f).exists() for f in need):
+            return cached
     except Exception:  # noqa: BLE001  (not cached yet)
         pass
     try:
-        return Path(snapshot_download(HF_REPO, **kw))
+        p = Path(snapshot_download(HF_REPO, **kw))
     except Exception as e:  # noqa: BLE001  (network, access, disk: one clear message)
         reason = (str(e).strip().splitlines() or [type(e).__name__])[0]
         raise ModelError(
@@ -73,3 +80,7 @@ def model_dir(
             f"{type(e).__name__}: {reason[:200]}. Check the network connection, or "
             "point at a local model folder with --model-dir or INDRA_OCR_MODEL_DIR."
         ) from e
+    missing = [f for f in need if not (p / f).exists()]
+    if missing:
+        raise ModelError(f"the model folder {p} lacks {', '.join(missing)}")
+    return p
