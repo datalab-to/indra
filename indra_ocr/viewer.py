@@ -505,7 +505,7 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
   <label class="sw">Reading order<input type="checkbox" class="disp" data-c="order"></label>
   <div id="legend" class="hint"></div></div>
  <div class="group"><div class="label">Run</div><div id="status"></div><div id="stats"></div></div>
- <div class="callout">Need handwriting, math and tables at the highest accuracy? <a href="https://www.datalab.to/?utm_source=indra-viewer" target="_blank" rel="noopener">Chandra on Datalab</a> reads them, with $5 in free credits to start.</div>
+ <div class="callout">Need handwriting, math and tables at the highest accuracy? <a href="https://www.datalab.to/?utm_source=indra-viewer" target="_blank" rel="noopener">Chandra on Datalab</a> reads them, with about 5,000 free convert pages every month (work email).</div>
 </aside>
 <main id="out"><div class="empty"><h2>Read a document</h2>Drop a PDF or an image on the left. Pages appear as they finish, with lines, layout blocks and reading order drawn over each page.</div></main>
 </div>

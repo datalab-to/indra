@@ -38,11 +38,13 @@ Indra OCR is named for [Indra](https://en.wikipedia.org/wiki/Indra).
 
 ## Try Datalab's Managed Platform
 
-Indra OCR is built for speed on CPUs. When you need the highest accuracy, on handwriting, math, complex tables and degraded scans, our managed platform runs [Chandra](https://github.com/datalab-to/chandra), our state of the art OCR model, with zero data retention by default, SOC 2 Type 2, and custom BAAs.
+Indra OCR is built for speed on CPUs. When you need the highest accuracy, on handwriting, math, complex tables and degraded scans, our managed platform uses [Chandra](https://github.com/datalab-to/chandra), our state of the art OCR model, and other models, with opt-in zero data retention, SOC 2 Type 2, and custom BAAs.
 
-If you have high volume workloads, we offer a batch processing service that can handle 1B+ pages a day.
+If you have high volume workloads, we offer a batch processing service that has processed 1B+ pages in a day at peak.
 
-Get started with **$5 in free credits** - [sign up](https://www.datalab.to/?utm_source=gh-indra) - or try Chandra in our [public playground](https://www.datalab.to/playground?utm_source=gh-indra).
+The Datalab API turns documents into verifiable knowledge your agents act on. Every result traces back to its page and position, and one API can parse, extract, fill and edit documents.
+
+Get started with **about 5,000 free convert pages every month** (work email) - [sign up](https://www.datalab.to/?utm_source=gh-indra) - or try Chandra in our [public playground](https://www.datalab.to/playground?utm_source=gh-indra).
 
 ## Quickstart
 
