@@ -114,14 +114,14 @@ def test_lines_with_hanzi_go_to_the_cjk_recognizer():
         def __init__(self, tok):
             self.tok = tok
 
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             b, w = feed["x"].shape[0], feed["x"].shape[-1] // 4
             best = np.zeros((b, w), np.int64)
             best[:, ::2] = self.tok
             return best, np.ones((b, w), np.float32), np.full(b, w)
 
     class Script:  # lines wider than 300 px "hold hanzi"
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             return [(feed["widths"] > 300).astype(np.float32)]
 
     ocr = OrtOCR.__new__(OrtOCR)
@@ -139,7 +139,7 @@ def test_a_turned_page_is_turned_upright_before_detection():
     from indra_ocr.pipeline import OrtOCR
 
     class Orient:  # says: content turned one quarter turn counter-clockwise
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             assert feed["x"].shape == (1, 1, 768, 768)
             return [np.array([[0.01, 0.97, 0.01, 0.01]], np.float32)]
 
@@ -265,7 +265,7 @@ def test_a_vertical_page_reads_columns_as_lines_and_maps_boxes_back():
     from indra_ocr.pipeline import Line, OrtOCR, Page
 
     class Orient:  # five classes: the page is set in vertical columns
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             return [np.array([[0.01, 0.0, 0.0, 0.01, 0.98]], np.float32)]
 
     seen = {}
