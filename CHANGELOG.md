@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Bounded GPU memory.** On CUDA, every run gives ONNX Runtime's arena memory back (`memory.enable_memory_arena_shrinkage`); it used to keep the largest allocation any page ever needed (119 mixed pages on an A100: 2.1 GB held for good -> 0.66 GB idle, same speed). The CPU path is unchanged.
+
 ## 1.1.2
 
 Same models (Hugging Face tag `v1.1.0`).
