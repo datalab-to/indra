@@ -59,7 +59,7 @@ class MathReader:
         }
         self.cls, self.enc = s["mathcls.onnx"], s["math_enc.onnx"]
         self.init, self.step = s["math_dec_init.onnx"], s["math_dec_step.onnx"]
-        meta = json.loads((onnx_dir / "math_meta.json").read_text())
+        meta = json.loads((onnx_dir / "math_meta.json").read_text(encoding="utf-8"))
         cfg = meta["config"]
         self.height = cfg["height"]
         self.max_tokens = cfg["max_tokens"]

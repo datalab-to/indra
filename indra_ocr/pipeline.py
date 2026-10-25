@@ -321,7 +321,7 @@ class OrtOCR:
             if (onnx_dir / "orient.onnx").exists()
             else None
         )
-        meta = json.loads(Path(need("meta.json")).read_text())
+        meta = json.loads(Path(need("meta.json")).read_text(encoding="utf-8"))
         self.vocab = Vocab.from_json(meta["vocab"])
         # Scripts: a line classifier routes each line to its group's recognizer
         # (rec_<group>.onnx with meta["vocab_<group>"]), in script.onnx's class
