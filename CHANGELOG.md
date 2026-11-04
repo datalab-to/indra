@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A page with a line crop narrower than 32 px (a lone letter detected as a line) no longer fails in the script classifier ([#24](https://github.com/datalab-to/indra/issues/24)): a batch is padded to at least 32 columns.
+
 ## 1.1.2
 
 Same models (Hugging Face tag `v1.1.0`).

@@ -22,6 +22,13 @@ LINE_HEIGHT = 32
 PAD_Y = 0.2
 PAD_X = 0.3
 WIDTH_MULTIPLE = 8  # widths are padded to a multiple of this (timestep stride)
+# A batch is at least this wide: the classifiers pool their input by 32, and a
+# batch of one crop narrower than that (a lone letter detected as a line: a
+# 38 x 102 px box is 22 px at the 32-px band) pooled to zero columns, which
+# onnxruntime 1.19.2 rejects (ReduceSum on CUDA, Gemm on CPU: input_shape {1,0})
+# and failed the page.  The widths tensor keeps the true widths, so the
+# models' masking is unchanged.
+MIN_BATCH_WIDTH = 32
 
 
 def _percentiles(b: np.ndarray, qs=(0.02, 0.5, 0.98)) -> list[float]:
@@ -101,10 +108,13 @@ def crop_line(
     return ink if dark else 1.0 - ink
 
 
-def pad_batch(lines: list[np.ndarray], multiple: int = WIDTH_MULTIPLE):
-    """Right-pad ink maps to one width.  Returns (array [B, 1, H, W], widths [B])."""
+def pad_batch(
+    lines: list[np.ndarray], multiple: int = WIDTH_MULTIPLE, min_width: int = MIN_BATCH_WIDTH
+):
+    """Right-pad ink maps to one width (at least ``min_width``).  Returns
+    (array [B, 1, H, W], widths [B])."""
     H = lines[0].shape[0]
-    Wm = max(x.shape[1] for x in lines)
+    Wm = max(max(x.shape[1] for x in lines), min_width)
     Wm = int(math.ceil(Wm / multiple) * multiple)
     out = np.zeros((len(lines), 1, H, Wm), np.float32)
     widths = np.zeros(len(lines), np.int64)
