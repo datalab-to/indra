@@ -3,6 +3,7 @@
 ## Unreleased
 
 - A page with a line crop narrower than 32 px (a lone letter detected as a line) no longer fails in the script classifier ([#24](https://github.com/datalab-to/indra/issues/24)): a batch is padded to at least 32 columns.
+- **Bounded GPU memory.** On CUDA, every run gives ONNX Runtime's arena memory back (`memory.enable_memory_arena_shrinkage`); it used to keep the largest allocation any page ever needed (119 mixed pages on an A100: 2.1 GB held for good -> 0.66 GB idle, same speed). The CPU path is unchanged.
 
 ## 1.1.2
 

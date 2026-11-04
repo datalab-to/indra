@@ -50,8 +50,12 @@ def detokenize(tokens: list[str]) -> str:
 
 
 class MathReader:
-    def __init__(self, onnx_dir: Path, so, providers):
+    ro = None  # RunOptions for every run (pipeline.gpu_run_options)
+
+    def __init__(self, onnx_dir: Path, so, providers, run_options=None):
         import onnxruntime as ort
+
+        self.ro = run_options
 
         s = {
             f: ort.InferenceSession(str(onnx_dir / f), so, providers=providers)
@@ -70,10 +74,10 @@ class MathReader:
         self.inputs = {f: {i.name for i in v.get_inputs()} for f, v in s.items()}
 
     @classmethod
-    def load(cls, onnx_dir: Path, so, providers) -> "MathReader | None":
+    def load(cls, onnx_dir: Path, so, providers, run_options=None) -> "MathReader | None":
         names = (*FILES, "math_meta.json")
         if all((onnx_dir / f).exists() for f in names):
-            return cls(onnx_dir, so, providers)
+            return cls(onnx_dir, so, providers, run_options)
         return None
 
     def flags(self, crops: list, batch: int = 64) -> list[bool]:
@@ -81,7 +85,7 @@ class MathReader:
         out = [False] * len(crops)
         for idx in width_batches([c.shape[1] for c in crops], batch):
             arr, widths = pad_batch([crops[j] for j in idx])
-            p = self.cls.run(None, {"x": arr, "widths": widths})[0]
+            p = self.cls.run(None, {"x": arr, "widths": widths}, self.ro)[0]
             for k, j in enumerate(idx):
                 out[j] = bool(p[k] > MATH_MIN)
         return out
@@ -97,10 +101,10 @@ class MathReader:
         widths = [c.shape[1] for c in crops]
         for idx in width_batches(widths, batch, max_ratio=4.0, max_area=16 * 64 * 640):
             arr, widths = pad_batch([crops[j] for j in idx])
-            mem, mask = self.enc.run(None, {"x": arr, "widths": widths})
+            mem, mask = self.enc.run(None, {"x": arr, "widths": widths}, self.ro)
             feed = {"memory": mem, "mask": mask}
             names = self.inputs["math_dec_init.onnx"]
-            ck, cv = self.init.run(None, {k: v for k, v in feed.items() if k in names})
+            ck, cv = self.init.run(None, {k: v for k, v in feed.items() if k in names}, self.ro)
             B = len(idx)
             sk = np.zeros((self.layers, B, self.heads, 0, self.head_dim), np.float32)
             sv = sk
@@ -120,7 +124,7 @@ class MathReader:
                     "mask": mask,
                 }
                 logits, sk, sv = self.step.run(
-                    None, {k: v for k, v in feed.items() if k in step_in}
+                    None, {k: v for k, v in feed.items() if k in step_in}, self.ro
                 )
                 tok = logits.argmax(-1).astype(np.int64)
                 e = np.exp(logits - logits.max(-1, keepdims=True))
