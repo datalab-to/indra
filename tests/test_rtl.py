@@ -31,7 +31,7 @@ def test_rtl_lines_read_in_logical_order_right_column_first():
     vocab_rtl = Vocab(list("שלום "))  # ids 1..5
 
     class Rec:  # reads the letters of "שלום" left to right: ם ו ל ש
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             b, w = feed["x"].shape[0], feed["x"].shape[-1] // 4
             best = np.zeros((b, w), np.int64)
             for i, t in enumerate([4, 3, 2, 1]):
@@ -39,7 +39,7 @@ def test_rtl_lines_read_in_logical_order_right_column_first():
             return best, np.ones((b, w), np.float32), np.full(b, w)
 
     class Script:  # four groups; every line is right-to-left
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             p = np.zeros((len(feed["widths"]), 4), np.float32)
             p[:, 2] = 1.0
             return [p]
@@ -71,14 +71,14 @@ def test_two_way_classifier_routes_to_the_world_recognizer():
         def __init__(self, tok):
             self.tok = tok
 
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             b, w = feed["x"].shape[0], feed["x"].shape[-1] // 4
             best = np.zeros((b, w), np.int64)
             best[:, 1] = self.tok
             return best, np.ones((b, w), np.float32), np.full(b, w)
 
     class Script:  # lines wider than 300 px are "world"
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             wide = feed["widths"] > 300
             return [np.stack([~wide, wide], 1).astype(np.float32)]
 
@@ -100,14 +100,14 @@ def test_unsure_line_keeps_the_more_confident_reading():
         def __init__(self, tok, conf):
             self.tok, self.conf = tok, conf
 
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             b, w = feed["x"].shape[0], feed["x"].shape[-1] // 4
             best = np.zeros((b, w), np.int64)
             best[:, 1] = self.tok
             return best, np.full((b, w), self.conf, np.float32), np.full(b, w)
 
     class Script:  # world, but only 60% sure
-        def run(self, _, feed):
+        def run(self, _, feed, run_options=None):
             n = len(feed["widths"])
             return [np.tile(np.array([[0.3, 0.1, 0.6]], np.float32), (n, 1))]
 

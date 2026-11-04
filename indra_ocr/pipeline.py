@@ -252,7 +252,37 @@ class Page:
         return [b["bbox"] for b in self.blocks if b["label"] == "Picture"]
 
 
+def gpu_run_options(providers: list):
+    """RunOptions for sessions on a GPU: give the arena's free memory back after
+    every run.  None on CPU.
+
+    ONNX Runtime's CUDA provider keeps the largest allocation each session ever
+    needed (its BFC arena never shrinks on its own), and the line batches change
+    shape with every page, so a process grows until the device is full.  119
+    mixed pages on an A100 (onnxruntime-gpu 1.19.2): 0.57 GB after loading,
+    2.1 GB after the run and held for good; in a service with 8 workers on a
+    16 GB T4, one worker reached 5.2 GB and pages failed with CUDA OOM.  With
+    ``memory.enable_memory_arena_shrinkage`` on each run the same 119 pages
+    idle at 0.66 GB (peak 1.7 GB while a page runs), at the same speed (4.7
+    vs 4.5 pages/s).  The CPU arena is off instead (enable_cpu_mem_arena
+    above), which this does not touch.  The device is the provider's
+    ``device_id`` (0 by default)."""
+    for p in providers:
+        name, opts = (p, {}) if isinstance(p, str) else (p[0], p[1] or {})
+        if name == "CUDAExecutionProvider":
+            import onnxruntime as ort
+
+            ro = ort.RunOptions()
+            ro.add_run_config_entry(
+                "memory.enable_memory_arena_shrinkage", f"gpu:{opts.get('device_id', 0)}"
+            )
+            return ro
+    return None
+
+
 class OrtOCR:
+    ro = None  # RunOptions for every run: arena shrinkage on a GPU (gpu_run_options)
+
     def __init__(
         self,
         onnx_dir: str | Path,
@@ -292,6 +322,7 @@ class OrtOCR:
         # scan peaked at 4.9 GB), and it bought no measurable speed.
         so.enable_cpu_mem_arena = False
         prov = providers or ["CPUExecutionProvider"]
+        self.ro = gpu_run_options(prov)  # passed to every run (None on CPU)
 
         def need(name: str) -> str:
             p = onnx_dir / name
@@ -341,7 +372,7 @@ class OrtOCR:
                 str(onnx_dir / "script.onnx"), so, providers=prov
             )
         # Math: a line classifier routes lines with math to MathRec (math.py).
-        self.math = MathReader.load(onnx_dir, so, prov) if math else None
+        self.math = MathReader.load(onnx_dir, so, prov, self.ro) if math else None
         if math and self.math is None:
             raise FileNotFoundError(f"math=True needs the math models in {onnx_dir}")
         self.long_side = meta["det_long_side"]
@@ -374,7 +405,7 @@ class OrtOCR:
 
     def _detect_at(self, gray: np.ndarray, long_side: int):
         x, s = page_to_input(gray, long_side)
-        out = self.det.run(None, {"x": x[None, None]})[0][0]
+        out = self.det.run(None, {"x": x[None, None]}, self.ro)[0][0]
         self._pic = (out[3], s) if out.shape[0] > 3 else None
         return decode(out), s
 
@@ -469,6 +500,7 @@ class OrtOCR:
                 res = sess.run(
                     OUT_GREEDY + (OUT_LM if use_lm else []),
                     {"x": arr, "widths": widths},
+                    self.ro,
                 )
                 best, pmax, lengths = res[:3]
                 stride = arr.shape[-1] / max(best.shape[1], 1)
@@ -544,7 +576,7 @@ class OrtOCR:
         sure = [True] * len(crops)
         for idx in width_batches([c.shape[1] for c in crops], batch):
             arr, widths = pad_batch([crops[j] for j in idx])
-            p = self.script.run(None, {"x": arr, "widths": widths})[0]
+            p = self.script.run(None, {"x": arr, "widths": widths}, self.ro)[0]
             for k, j in enumerate(idx):
                 g = (
                     ("cjk" if p[k] > 0.5 else "base")
@@ -645,7 +677,7 @@ class OrtOCR:
             return order, None, None
         f = line_features(boxes[:, :4], wh, texts)[None]
         outs = self.order.run(
-            None, {"feats": f, "mask": np.ones((1, len(boxes)), bool)}
+            None, {"feats": f, "mask": np.ones((1, len(boxes)), bool)}, self.ro
         )
         if len(outs) >= 3:
             # Layout heads: blocks from the same-block head, lines inside a block by
@@ -661,7 +693,7 @@ class OrtOCR:
         """orient.onnx class probabilities for the page (None without the model)."""
         if self.orient is None:
             return None
-        return self.orient.run(None, {"x": orient_input(gray)[None, None]})[0][0]
+        return self.orient.run(None, {"x": orient_input(gray)[None, None]}, self.ro)[0][0]
 
     def orientation(self, gray: np.ndarray) -> int:
         """Quarter turns (counter-clockwise) the page content is turned by, from
