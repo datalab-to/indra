@@ -4,6 +4,14 @@
 
 - A page with a line crop narrower than 32 px (a lone letter detected as a line) no longer fails in the script classifier ([#24](https://github.com/datalab-to/indra/issues/24)): a batch is padded to at least 32 columns.
 - **Bounded GPU memory.** On CUDA, every run gives ONNX Runtime's arena memory back (`memory.enable_memory_arena_shrinkage`); it used to keep the largest allocation any page ever needed (119 mixed pages on an A100: 2.1 GB held for good -> 0.66 GB idle, same speed). The CPU path is unchanged.
+- **Turning math on after a run without it.** The models download on demand, and a
+  first run without `--math` leaves the math models out of the cached snapshot. That
+  folder was then trusted for every later run, so turning math on failed with
+  `FileNotFoundError: math=True needs the math models in ...`, and retrying never
+  recovered (the cached folder is returned before the download is attempted). The
+  cached folder is now checked for the files the run needs, the download completes
+  it, and a folder that still lacks them raises a `ModelError` naming them
+  ([#18](https://github.com/datalab-to/indra/issues/18)).
 
 ## 1.1.2
 
