@@ -22,6 +22,7 @@ the checks fail (and OCR only on pages with no text at all).
 
 from __future__ import annotations
 
+import ctypes
 import time
 import unicodedata
 from pathlib import Path
@@ -94,7 +95,20 @@ def _covered(box, boxes: np.ndarray, frac: float = 0.5) -> bool:
 
 
 def _render(page, scale: float) -> np.ndarray:
-    arr = page.render(scale=scale, grayscale=True).to_numpy()
+    import pypdfium2 as pdfium
+    import pypdfium2.internal as pdfium_i
+
+    def empty_bitmap(width, height, format, rev_byteorder=False):
+        # The render fills every pixel, so the buffer needs no zeroing first.
+        size = width * height * pdfium_i.BitmapTypeToNChannels[format]
+        buffer = (ctypes.c_ubyte * size).from_buffer(np.empty(size, np.uint8))
+        return pdfium.PdfBitmap.new_native(
+            width, height, format, rev_byteorder, buffer=buffer
+        )
+
+    arr = page.render(
+        scale=scale, grayscale=True, bitmap_maker=empty_bitmap
+    ).to_numpy()
     return np.ascontiguousarray(arr[..., 0] if arr.ndim == 3 else arr)
 
 
