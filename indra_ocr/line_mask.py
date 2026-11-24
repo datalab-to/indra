@@ -1,7 +1,7 @@
 """Mask a line window with CenterMask before the recognizer crops the line.
 
-One function for training and inference: the recognizer must only ever see
-crops that went through the same exported mask model (mask.onnx).
+The recognizer must only ever see crops that went through the mask model
+(mask.onnx) when the model folder has one.
 
     sess = load_mask("mask.onnx")
     win, box_in_win = masked_window(gray, box, sess)
@@ -62,7 +62,7 @@ def mask_windows(sess, wins: list[np.ndarray]) -> list[np.ndarray]:
 
     The probabilities are scaled back bilinearly before the threshold: a
     threshold at mask resolution with a nearest-neighbour upscale breaks the
-    stroke edges (surya OCR 2 CER on M804 lines 0.30 -> 0.36)."""
+    stroke edges and the recognizer reads worse."""
     import cv2
 
     if not wins:
@@ -145,7 +145,7 @@ _SESSIONS: dict = {}
 
 
 def session_for(path: str | None):
-    """One CPU session per process (dataloader workers call this lazily)."""
+    """One CPU session per process, made on first use."""
     if not path:
         return None
     if path not in _SESSIONS:

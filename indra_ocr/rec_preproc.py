@@ -1,15 +1,15 @@
-"""Line crop rule shared by recognition training and inference.
+"""Line crop rule for the recognizers.
 
-A recognizer input is made from a line box (the ink box from the detector, or
-the ink box from a synthetic or real label) in three steps:
+A recognizer input is made from a line box (an ink box, as the detector
+gives) in three steps:
   1. expand the box by PAD_Y x its height on top and bottom and PAD_X x its
      height on left and right,
   2. crop that region from the page (white outside the page),
   3. resize the crop to LINE_HEIGHT pixels high, keeping the aspect ratio.
 
 The result is an ink map (0 = paper, 1 = ink) of shape [LINE_HEIGHT, W].
-Training and inference must both call ``crop_line``, so the text scale and the
-margins match.
+The recognizers expect exactly this text scale and these margins: every
+recognizer input goes through ``crop_line``.
 """
 
 from __future__ import annotations
@@ -106,6 +106,25 @@ def crop_line(
     resized = cv2.resize(crop, (out_w, height), interpolation=interp)
     ink = resized.astype(np.float32) / 255.0
     return ink if dark else 1.0 - ink
+
+
+def widen(lines: list[np.ndarray], xscale: float) -> list[np.ndarray]:
+    """Line ink maps resized to xscale times their width (same height), for a
+    recognizer that reads widened lines (meta.json rec_xscale_<group>): Nastaliq
+    stacks several letters in the width of one, and widened lines give the
+    recognizer a timestep for each."""
+    if xscale == 1:
+        return lines
+    import cv2
+
+    return [
+        cv2.resize(
+            x,
+            (max(WIDTH_MULTIPLE, round(x.shape[1] * xscale)), x.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        for x in lines
+    ]
 
 
 def pad_batch(

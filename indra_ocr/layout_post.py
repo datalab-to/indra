@@ -305,18 +305,23 @@ def page_markdown(
     cells: dict | None = None,
     tab: np.ndarray | None = None,
     pictures: np.ndarray | None = None,
+    tables: dict | None = None,
 ) -> str:
     """Markdown for one page.  boxes [N, 4], texts [N], order = reading order,
     cls_logits [N, C], same [N, N] (logit "same block").  ``cells`` maps a line
     to its table cells [(box, text)] when the line holds several.  ``tab``
     [3, N, N] (same row / column / cell logits) builds tables from the heads.
     ``pictures`` [P, 4]: picture regions, each written as ``![](picture-<k>)``
-    before the first block below it that it overlaps horizontally."""
+    before the first block below it that it overlaps horizontally.  ``tables``
+    maps a table block (its line indices as a tuple) to HTML read by tsr_rel.onnx."""
     parts: list[str] = []
     part_boxes: list = []
     for blk in split_blocks(order, same):
         n_parts = len(parts)
-        _block_part(parts, blk, boxes, texts, cls_logits, keep_furniture, cells, tab)
+        if tables and tuple(blk) in tables:
+            parts.append(tables[tuple(blk)])
+        else:
+            _block_part(parts, blk, boxes, texts, cls_logits, keep_furniture, cells, tab)
         if len(parts) > n_parts:
             b = boxes[blk, :4]
             part_boxes.append(

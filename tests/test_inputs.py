@@ -12,9 +12,11 @@ class StubOCR:
 
     def __init__(self):
         self.seen = []
+        self.rotations = []
 
-    def __call__(self, gray, turn=True):
+    def __call__(self, gray, turn=True, rotation=None):
         self.seen.append(gray.shape)
+        self.rotations.append(rotation)
         if gray.max() == 0:
             raise RuntimeError("stub failure")
         return Page([])

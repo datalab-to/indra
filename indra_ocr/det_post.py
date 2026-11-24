@@ -1,7 +1,6 @@
-"""Torch-free pre- and post-processing for LineNet (shared by training and inference).
+"""Pre- and post-processing for LineNet, the line detector.
 
-Inference with ONNX Runtime needs only numpy and cv2, so these functions live
-apart from the PyTorch model in det_model.py, which re-exports them.
+Inference with ONNX Runtime needs only numpy and cv2.
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ import math
 
 import numpy as np
 
-# Target geometry, shared by training (encode) and inference (decode).
+# Output geometry: the line core band that decode reads.
 CORE_FRAC = 0.4  # core band height as a fraction of the line ink height
 CORE_X_SHRINK = 0.15  # the core is shorter than the line by this fraction of its height, at each end
 OUT_STRIDE = 2
@@ -18,7 +17,7 @@ INPUT_MULTIPLE = 32  # H and W must divide by this
 
 
 # ---------------------------------------------------------------------------
-# Input preprocessing (shared by training and inference)
+# Input preprocessing
 # ---------------------------------------------------------------------------
 
 
@@ -51,11 +50,11 @@ def encode_targets(
     valid_hw: tuple[int, int],
     ignore: np.ndarray | None = None,
 ):
-    """Build training targets at 1/2 resolution.
+    """The detector's output maps for known line boxes, at 1/2 resolution.
 
     boxes:   [N, 4] line ink boxes in input pixels (x0, y0, x1, y1)
     in_hw:   padded input size; valid_hw: size of the real page inside it
-    ignore:  [M, 4] regions with no loss, in input pixels
+    ignore:  [M, 4] regions with weight 0, in input pixels
 
     Returns core [h, w] float32, dist [2, h, w] float32, weight [h, w] float32
     (0 on padding and ignore regions), and reg_mask [h, w] bool (core pixels).

@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# The Hugging Face repo and the tag the package downloads.
 HF_REPO = "datalab-to/indra-ocr"
-# Model set this package version was built and tested against (a tag in HF_REPO).
-HF_REVISION = "v1.1.0"
+HF_REVISION = "v1.2.0"
 FILES = ("det.onnx", "rec.onnx", "order.onnx", "meta.json")
 
 
@@ -20,9 +20,39 @@ MATH_FILES = (
     "mathcls.onnx",
     "math_enc.onnx",
     "math_dec_init.onnx",
-    "math_dec_step.onnx",
+    "math_dec_step_kv.onnx",
     "math_meta.json",
 )
+# The older MathRec decoder step (stacked caches, same tokens as
+# math_dec_step_kv.onnx).  Downloads skip it.  A local model folder from before
+# math_dec_step_kv.onnx works with it in place of that file.
+MATH_STEP_STACKED = "math_dec_step.onnx"
+
+
+# Optional math files: downloaded with the math models, never required (an older
+# model folder without them keeps the default behavior).
+# the accept head and the read gate (math.MathReader) and the image span tagger (math_span_img.py)
+MATH_OPTIONAL = (
+    "math_accept.json",
+    "math_gate.json",
+    "math_span_img.onnx",
+    "math_span_img.json",
+)
+
+
+def download_patterns(math: bool = False) -> tuple[list[str], list[str]]:
+    """(allow_patterns, ignore_patterns) for the Hub download of the models."""
+    allow = [
+        "*.onnx",
+        "meta.json",
+        "math_span.json",  # the opt-in text-layer math span tagger's vocabulary
+        "table_verify.json",  # the optional false-table verifier (table_verify.py)
+        "lm.npz",
+        "lm_*.npz",
+        *(MATH_FILES + MATH_OPTIONAL if math else ()),
+    ]
+    ignore = [MATH_STEP_STACKED] if math else [*MATH_FILES, *MATH_OPTIONAL, MATH_STEP_STACKED]
+    return allow, ignore
 
 
 def model_dir(
@@ -40,24 +70,20 @@ def model_dir(
         p = Path(path).expanduser()
         missing = [f for f in FILES[:2] + FILES[3:] if not (p / f).exists()]
         if math:
-            missing += [f for f in MATH_FILES if not (p / f).exists()]
+            missing += [
+                f
+                for f in MATH_FILES
+                if not (p / f).exists()
+                and not (f == "math_dec_step_kv.onnx" and (p / MATH_STEP_STACKED).exists())
+            ]
         if missing:
             raise ModelError(f"the model folder {p} lacks {', '.join(missing)}")
         return p
     from huggingface_hub import snapshot_download
 
     rev = revision or HF_REVISION
-    kw = dict(
-        revision=rev,
-        allow_patterns=[
-            "*.onnx",
-            "meta.json",
-            "lm.npz",
-            "lm_*.npz",
-            *(MATH_FILES if math else ()),
-        ],
-        ignore_patterns=[] if math else list(MATH_FILES),
-    )
+    allow, ignore = download_patterns(math)
+    kw = dict(revision=rev, allow_patterns=allow, ignore_patterns=ignore)
     # The files this call must leave behind.  A cached snapshot can be partial:
     # a first run without math downloads no math models, and huggingface_hub
     # only notices on its own when the cache carries a tree index (it does not

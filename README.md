@@ -21,12 +21,12 @@
 
 # Indra OCR
 
-Indra OCR is a 1M-parameter OCR model that runs on CPU. It turns PDFs and images into markdown, text, or JSON with boxes, and it reads handwriting, 80+ languages, and pages at any angle.
+Indra OCR is a compact OCR pipeline that runs on CPU. It turns PDFs and images into markdown, text, or JSON with boxes, and it reads handwriting, 80+ languages, and pages at any angle.
 
-- **Accurate** - 66.7 on [OmniParseBench](https://github.com/datalab-to/omni_parse_bench) (71.4 with `--math`), ahead of PaddleOCR's full PP-StructureV3 pipeline (58.4). Its text score (46.7) is ahead of PaddleOCR's PP-OCR text models (35.8) and Tesseract (19.3).
-- **Fast** - about 44 pages/s on 32 CPU cores, 15x Tesseract and 10x PaddleOCR's PP-OCR text models on the same machine type and pages, and about 210 ms per page on 4 cores ([benchmarks](#benchmarks))
+- **Accurate** - 78.9 on [OmniParseBench](https://github.com/datalab-to/omni_parse_bench) with math enabled (the default), or 71.6 with `--no-math`. See the versioned [benchmarks](#benchmarks).
+- **CPU-first** - ONNX Runtime, no PyTorch or GPU required. Use multiple processes for batch conversion.
 - **80+ languages** - Latin-script languages, Russian and the Cyrillic languages, Greek, Chinese, Japanese, Korean, Arabic, Persian, Urdu, Hebrew, Hindi and the Indic languages, Thai, Khmer and more ([languages](#languages))
-- **Handwriting** - handwritten pages and forms (25.2% on the OmniParseBench handwriting tests, see [limitations](#limitations))
+- **Handwriting** - handwritten pages and forms; cursive and faint pencil remain difficult (see [limitations](#limitations))
 - **Real-world scans** - sideways, upside down, tilted up to 45 degrees, light text on dark ground
 - **Layout** - a box, a label and a reading order for every line and block (headings, lists, tables, captions, footnotes, page headers)
 - **Digital PDFs** - reads the text layer in any script, and OCRs only what is missing
@@ -34,7 +34,7 @@ Indra OCR is a 1M-parameter OCR model that runs on CPU. It turns PDFs and images
 
 Indra OCR is named for [Indra](https://en.wikipedia.org/wiki/Indra).
 
-<img src="assets/benchmarks/throughput.png" width="700px"/>
+<!-- The historical throughput measurements are documented below. -->
 
 ## Try Datalab's Managed Platform
 
@@ -58,7 +58,7 @@ indra-ocr scan.png --format json       # lines, boxes, layout blocks, confidence
 indra-ocr-viewer                       # local web viewer on http://localhost:8765
 ```
 
-The first run downloads the models (about 76 MB) from [Hugging Face](https://huggingface.co/datalab-to/indra-ocr).
+The first run downloads the models (about 114 MB with math enabled) from [Hugging Face](https://huggingface.co/datalab-to/indra-ocr).
 
 ## Examples
 
@@ -76,11 +76,18 @@ Real Indra OCR outputs on OmniParseBench pages. Colored boxes are layout blocks 
 
 # License
 
-The code is [Apache 2.0](https://github.com/datalab-to/indra/blob/main/LICENSE). The model weights use a modified OpenRAIL-M license ([LICENSE](https://huggingface.co/datalab-to/indra-ocr/blob/main/LICENSE)).
+Indra OCR has two parts with two licenses:
+
+| Part | Where it comes from | License |
+|---|---|---|
+| Code (this repository, the `indra-ocr` package) | GitHub, PyPI | [Apache 2.0](LICENSE) |
+| Model weights (the `.onnx`, `.npz` and `.json` model files) | [Hugging Face](https://huggingface.co/datalab-to/indra-ocr), downloaded on the first run | Modified OpenRAIL-M: [MODEL_LICENSE](MODEL_LICENSE), the same text as the [Hugging Face license](https://huggingface.co/datalab-to/indra-ocr/blob/main/LICENSE) |
+
+GitHub shows only Apache 2.0 because it reads the `LICENSE` file. The Apache 2.0 license does not cover the model weights. To use Indra OCR, you need both: the code under Apache 2.0, and the weights under the model license. See [Commercial usage](#commercial-usage) for what the model license allows.
 
 # Commercial usage
 
-This code is Apache 2.0, and our model weights use a modified OpenRAIL-M license (free for research, personal use, and startups under $20M funding/revenue, cannot be used competitively with our API). To remove the OpenRAIL license requirements, or for broader commercial licensing, visit our pricing page [here](https://www.datalab.to/pricing?utm_source=gh-indra).
+This code is Apache 2.0, and our model weights use a modified OpenRAIL-M license (free for research, personal use, and startups under $5M funding/revenue, cannot be used competitively with our API). To remove the OpenRAIL license requirements, or for broader commercial licensing, visit our pricing page [here](https://www.datalab.to/pricing?utm_source=gh-indra).
 
 # Installation
 
@@ -88,7 +95,7 @@ This code is Apache 2.0, and our model weights use a modified OpenRAIL-M license
 pip install indra-ocr
 ```
 
-The default models are about 76 MB: 30 MB of networks and 46 MB of language models for unsure lines. The main recognizer, `rec.onnx` (Latin script), has about 1.25M parameters, and all default models together have 7.3M (the optional math models are extra).
+The default model download is about 114 MB, including math. Use `--no-math` or `load(math=False)` to skip the math readers. The models include recognizers for each script group, layout and table models, and language models.
 
 For the latest code from GitHub instead: `pip install git+https://github.com/datalab-to/indra.git`. To let the viewer compare with Tesseract, install `pip install "indra-ocr[tesseract]"` and a Tesseract binary.
 
@@ -106,7 +113,7 @@ indra-ocr paper.pdf --format text         # plain text, one line per detected li
 indra-ocr paper.pdf --mode ocr --timings  # ignore the text layer, OCR every page; timings on stderr
 indra-ocr paper.pdf --keep-furniture      # keep page headers and footers in the markdown
 indra-ocr *.pdf --out results/ --cores 8  # limit the cores (default: all usable cores)
-indra-ocr paper.pdf --math                # write math as LaTeX (off by default; slower on math pages)
+indra-ocr paper.pdf --no-math             # skip math recognition and its models
 ```
 
 **CLI Options:**
@@ -119,7 +126,8 @@ indra-ocr paper.pdf --math                # write math as LaTeX (off by default;
 - `--max-pages N`: read at most N pages per file
 - `--password`: password for encrypted PDFs
 - `--keep-furniture`: keep page headers and footers in the markdown
-- `--math`: write math as LaTeX (`$...$`); off by default, see [Math](#math)
+- `--math` / `--no-math`: write math as LaTeX (`$...$`); on by default, see [Math](#math)
+- `--words`: include word text and boxes in JSON output
 - `--timings`: print per-page source and time to stderr
 - `--model-dir`: folder with the models (default: download)
 
@@ -233,14 +241,14 @@ Most scripts have few tests, so one test moves a score by 2 to 8 points. On [Omn
 Indra OCR is built for speed on clean print. It is not the right tool for:
 
 - **Complex tables.** Tables with merged or spanning cells, cell text that wraps over several lines, nested headers, or no ruling lines can come out with cells in the wrong rows or columns. Simple grid tables read well.
-- **Handwriting.** Handwritten pages read, but not well: 25.2% on the OmniParseBench handwriting tests, and about a third of the words on held-out handwritten pages. Cursive and faint pencil read worst.
+- **Handwriting.** Handwritten pages remain less reliable than printed text. Cursive and faint pencil read worst.
 - **Scripts outside the OCR list.** Syriac, Tibetan, Mongolian, Santali, Meitei and other scripts not listed under [Languages](#languages) work only through a digital PDF's text layer. Khmer and Malayalam OCR are fair (65 to 71 on OmniParseBench). Written Cantonese characters (嘅 咗 冇) are not in the Chinese recognizer.
 - **Latin languages with many diacritics.** Some of them (Kurmanji, Czech, Lithuanian, Icelandic, Turkish, Slovak) read less well: the recognizer sometimes writes a close diacritic instead of the right one (ñ for ň, ú for ů, é for ė). English, French, German and Spanish are not affected.
 - **Degraded scans.** Old, faded or low-resolution scans read poorly (29.5% on the OmniParseBench degraded-scan tests).
 
 Also:
 
-- Math comes out as plain text unless `--math` is on (see [Math](#math)).
+- Math recognition is on by default. With `--no-math`, formulas remain text-recognizer output (see [Math](#math)).
 - Vertical pages read their columns right to left and their tiers top to bottom; a newspaper whose articles wind across tiers can come out in the wrong article order. Vertical scans read less well than horizontal ones.
 - Very wide, banner-shaped pages read poorly.
 - Labels inside engineering drawings often come out as small tables.
@@ -250,23 +258,42 @@ For these documents, [Chandra on Datalab](https://www.datalab.to/?utm_source=gh-
 
 # Math
 
-Math is off by default. With `--math` (or `indra_ocr.load(math=True)`), a small classifier finds the lines that hold math, and a second recognizer reads them as text with inline LaTeX (`we have $x _ { i } \leq 1$`).
+Math recognition is on by default in 1.2.0. A small classifier identifies candidate lines; a math reader writes formulas as inline LaTeX while keeping surrounding prose from the text reader. A read gate and an accept model reduce unnecessary reads and false formulas. An image span tagger handles inline formulas in non-Latin text.
 
-On OmniParseBench (all 2,937 pages, default settings otherwise):
+Use `indra-ocr paper.pdf --no-math` or `indra_ocr.load(math=False)` to disable math recognition and skip its model downloads. `--math-spans` also reads inline math inside native PDF text-layer lines, and `--math-rescore` enables a slower beam-search fallback; both remain off by default.
 
-| | headline | text | tables | layout | math tests |
-|---|---|---|---|---|---|
-| Indra OCR | 66.7 | 46.7 | 61.1 | 92.2 | 14.0 |
-| Indra OCR `--math` | **71.4** | **62.7** | 59.6 | 92.0 | **55.8** |
-| PaddleOCR PP-StructureV3 | 58.4 | 55.6 | 47.8 | 71.7 | – |
-
-- With `--math`, Indra OCR is ahead of PaddleOCR's PP-StructureV3 on the headline, text, tables and layout. Without it, PP-StructureV3 leads on text.
-- Tables lose 1.5 points: numbers in some table cells are read as math.
-- `--math` is slower. On x86, one page at a time on 4 vCPUs in auto mode, the median page takes 357 ms with `--math` and 212 ms without. With one single-threaded worker per core, throughput is about 30% lower on 4 cores and 38% lower on 32 (measured in one container on 300 OmniParseBench pages).
-
-The math models download only when `--math` is on.
+Math can increase conversion time: see [Throughput, 1.2.0 against 1.1.2](#throughput-120-against-112).
 
 # Benchmarks
+
+## Indra OCR 1.2.0
+
+Full OmniParseBench (2,937 pages, 16,288 tests), run with the benchmark's own harness, Indra OCR adapter and scorer (omni-parse-bench 1.7.0, dataset commit `d70182b9`), default settings: auto mode, 200 dpi, page headers and footers kept. The headline is the mean of the text, tables and layout families.
+
+| Version and settings | headline | text | tables | layout |
+|---|---:|---:|---:|---:|
+| **1.2.0, math enabled (default)** | **78.9** | **68.0** | 75.9 | 92.7 |
+| 1.2.0, `--no-math` | 71.6 | 45.7 | **76.0** | **93.0** |
+| 1.1.2, default | 71.4 | 62.6 | 59.6 | 92.1 |
+
+Both 1.2.0 rows include the full test suite: disabling the math reader does not remove math-labelled tests. Against 1.1.2, most of the gain is in tables (+16.3) and text (+5.4). The OmniParseBench leaderboard lists an earlier Indra OCR run at 69.5; neither 0.3.2 nor 1.1.2 reproduces it with the current harness.
+
+### Throughput, 1.2.0 against 1.1.2
+
+Pages per second with the published method (one single-threaded worker per core, one page per task, OCR mode, the same 300 OmniParseBench pages), mean of 3 interleaved runs. Both versions ran in one container (34 CPUs, AMD EPYC family 25 model 1), not on the Genoa machine type of the historical table below, so compare the rows with each other only.
+
+| version and settings | 4 cores | 8 cores | 16 cores | 32 cores |
+|---|---:|---:|---:|---:|
+| 1.1.2, default | 4.82 | 9.15 | 17.27 | 30.14 |
+| 1.2.0, math enabled (default) | 3.77 | 7.21 | 13.15 | 20.82 |
+| 1.2.0, `--no-math` | 4.43 | 8.31 | 15.88 | 25.79 |
+
+Most of the extra time is the math reader, which reads the lines it flags as math; this page sample has many math-heavy pages. With `--no-math`, 1.2.0 has 8-14% lower throughput than 1.1.2, mainly from the new table structure model.
+
+## Historical comparisons (Indra OCR 1.1.0)
+
+The tables, charts and timing measurements below use 1.1.0 and its model set, with an earlier benchmark version (omni-parse-bench 1.0.0rc1, dataset revision `961c0f89`). They are kept because the other engines' runs saved only their per-test results and cannot be re-scored with the current version. Compare engines within one table, not across tables.
+
 
 ## OmniParseBench
 

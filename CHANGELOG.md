@@ -1,17 +1,22 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
-- A page with a line crop narrower than 32 px (a lone letter detected as a line) no longer fails in the script classifier ([#24](https://github.com/datalab-to/indra/issues/24)): a batch is padded to at least 32 columns.
-- **Bounded GPU memory.** On CUDA, every run gives ONNX Runtime's arena memory back (`memory.enable_memory_arena_shrinkage`); it used to keep the largest allocation any page ever needed (119 mixed pages on an A100: 2.1 GB held for good -> 0.66 GB idle, same speed). The CPU path is unchanged.
-- **Turning math on after a run without it.** The models download on demand, and a
-  first run without `--math` leaves the math models out of the cached snapshot. That
-  folder was then trusted for every later run, so turning math on failed with
-  `FileNotFoundError: math=True needs the math models in ...`, and retrying never
-  recovered (the cached folder is returned before the download is attempted). The
-  cached folder is now checked for the files the run needs, the download completes
-  it, and a folder that still lacks them raises a `ModelError` naming them
-  ([#18](https://github.com/datalab-to/indra/issues/18)).
+- Math recognition is now on by default. Use `--no-math` or `load(math=False)` for the previous opt-out behavior.
+- New math reader, inline formula spans in non-Latin text, and learned read/accept gates. Surrounding prose keeps the text reader's characters and accents.
+- Faster formula decoding, with the same output.
+- Better table structure: learned cell relations, section and unit rows, and leader-dot handling. A false-table verifier reduces charts and prose emitted as tables.
+- Table structure also reads row, column and header separator maps from a small new model (`tsr_split.onnx`, about 1.5 MB).
+- A small new model (`tsr_refine.onnx`, about 0.5 MB) refines which table words are header words and which words sit outside the table.
+- The printed-text and handwriting recognizers are retrained.
+- Layout models see line thumbnails, improving block grouping and reading order.
+- Better legacy PDF handling, including missing glyph runs, symbol fonts that encode minus/plus-minus as digits, and spaced superscripts.
+- Check confident half-turn predictions against line readings, reducing upside-down Indic output. Large drawings can use tiled detection; turned text has an optional extra pass.
+- Optional word boxes through `load(words=True)` or `--format json --words`.
+- Retains Windows UTF-8 model metadata, narrow-crop padding, partial-cache repair, and bounded CUDA arena fixes.
+- Models target `datalab-to/indra-ocr` at `v1.2.0`. Code remains Apache-2.0; the model license is included in `MODEL_LICENSE`. From 1.2.0, the free commercial use threshold for the model weights is $5M in revenue or funding (it was $20M). The README's License section shows which license covers the code and which covers the model weights ([#37](https://github.com/datalab-to/indra/issues/37)).
+- Full OmniParseBench (omni-parse-bench 1.7.0, the benchmark's own harness and scorer): 78.9 with math enabled, 71.6 with math disabled (1.1.2: 71.4). All 2,937 pages and 16,288 tests are included.
+- The handwriting language model (`lm.npz`) is rebuilt. Handwriting scores change by less than 0.01 (on a 0 to 1 scale).
 
 ## 1.1.2
 

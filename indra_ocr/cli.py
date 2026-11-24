@@ -53,6 +53,14 @@ def _page_count(v: str) -> int:
     return n
 
 
+def line_json(ln) -> dict:
+    """A line as JSON: words only when they were asked for (load(words=True))."""
+    d = asdict(ln)
+    if d.get("words") is None:
+        d.pop("words", None)
+    return d
+
+
 def main(argv=None):
     """Exit code 0, or 1 when an input failed or the models are not available."""
     from .models import ModelError
@@ -103,8 +111,24 @@ def _main(argv=None):
     ap.add_argument("--password", default=None, help="password of encrypted PDFs")
     ap.add_argument(
         "--math",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write math as LaTeX ($...$) (on by default; --no-math skips the math models)",
+    )
+    ap.add_argument(
+        "--math-spans",
         action="store_true",
-        help="write math as LaTeX ($...$); slower on pages with math (off by default)",
+        help="with --math, also read inline math inside text-layer lines (adds time on text-layer pages)",
+    )
+    ap.add_argument(
+        "--math-rescore",
+        action="store_true",
+        help="with --math, re-read lines MathRec is unsure of with a beam search (adds time on pages with math)",
+    )
+    ap.add_argument(
+        "--words",
+        action="store_true",
+        help="with --format json, give each line its words with boxes (lines[].words)",
     )
     ap.add_argument(
         "--keep-furniture",
@@ -128,6 +152,9 @@ def _main(argv=None):
         dpi=a.dpi,
         furniture=a.keep_furniture,
         math=a.math,
+        math_spans=a.math_spans,
+        math_rescore=a.math_rescore,
+        words=a.words,
         **source_options(a),
     )
     for path, result in results:
@@ -151,7 +178,7 @@ def _main(argv=None):
                             "skew": page.skew,
                             "vertical": page.vertical,
                             "note": page.note,
-                            "lines": [asdict(ln) for ln in page.lines],
+                            "lines": [line_json(ln) for ln in page.lines],
                             "markdown": page.markdown,
                             "blocks": page.blocks,
                             "timings": page.timings,

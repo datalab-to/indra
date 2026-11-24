@@ -1,7 +1,7 @@
 """Right-to-left text for a recognizer that reads every line left to right.
 
 A CTC recognizer emits characters in the order it sees them, left to right, so
-the label of a line with Arabic or Hebrew is its characters in visual order.
+its reading of a line with Arabic or Hebrew is the characters in visual order.
 ``flip`` turns logical order (how text is stored and typed) into visual order,
 and the same call turns visual order back into logical order:
 
@@ -17,7 +17,7 @@ right-to-left level changes to its mirror image, as a renderer draws it.
 
 This is a small subset of the Unicode bidi algorithm (UAX #9): it has no
 embeddings or isolates, and it resolves neutrals by runs.  It is its own
-inverse, so the labels and the decoding always agree.
+inverse, so text flipped to visual order and back is unchanged.
 """
 
 from __future__ import annotations
@@ -129,12 +129,12 @@ def flip(text: str, mirror: bool = True, base_rtl: bool | None = None) -> str:
 
 
 def visual_label(logical: str, base_rtl: bool | None = None) -> str:
-    """The recognizer's label for a line stored in logical order."""
+    """A line stored in logical order, in the visual order the recognizer writes."""
     return flip(normalize(logical), base_rtl=base_rtl)
 
 
 def label_from_visual(raw_visual: str, shapes: bool = False) -> str:
-    """The label for characters already in visual order, as stored (a PDF text
+    """The recognizer's visual-order form of characters already in visual order, as stored (a PDF text
     layer read by glyph position): normalize in logical order, then mirror.
     shapes: the text layer stores each bracket as the shape drawn (see
     ``brackets_as_shapes``), so it is already mirrored."""

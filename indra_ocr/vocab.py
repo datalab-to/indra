@@ -1,13 +1,13 @@
 """Token vocabulary for the line recognizer.
 
 Class 0 is the CTC blank.  Class i + 1 is ``tokens[i]``.  A token is one
-character, or one LaTeX command (``\\frac``, ``\\alpha``) inside math.  Labels
-are NFC normalized before encoding.  A training line with a token outside the
-vocabulary is dropped (``encode`` returns None), never silently altered.
+character, or one LaTeX command (``\\frac``, ``\\alpha``) inside math.  Text
+is NFC normalized before encoding.  For a text with a token outside the
+vocabulary, ``encode`` returns None: it never silently alters the text.
 
 ``Vocab.latin()`` is the first recognizer's character set.  ``Vocab.multi()``
 adds Cyrillic, full Greek, Devanagari, Bengali and LaTeX command tokens; math
-is written ``$...$`` in labels.
+is written ``$...$`` in text.
 """
 
 from __future__ import annotations
@@ -16,9 +16,8 @@ import json
 import re
 import unicodedata
 
-# Label canonicalization.  Each rule maps characters or runs that the image
-# cannot tell apart to one form, so neither training targets nor the eval
-# punish a reading that is visually correct.
+# Text canonicalization.  Each rule maps characters or runs that the image
+# cannot tell apart to one form.
 _CANON = str.maketrans(
     {
         # Romanian comma-below and Turkish/legacy cedilla look the same in most fonts.
@@ -56,7 +55,7 @@ def _printable(chars) -> list[str]:
         if cat.startswith(("C", "Z")) and c != " ":
             continue  # control, format, unassigned, private, separators other than space
         if cat == "Mn":
-            continue  # combining marks: labels are NFC, marks come precomposed
+            continue  # combining marks: text is NFC, marks come precomposed
         out.append(c)
     return out
 

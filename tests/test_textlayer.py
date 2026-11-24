@@ -114,14 +114,14 @@ def test_lines_with_hanzi_go_to_the_cjk_recognizer():
         def __init__(self, tok):
             self.tok = tok
 
-        def run(self, _, feed, run_options=None):
+        def run(self, _, feed):
             b, w = feed["x"].shape[0], feed["x"].shape[-1] // 4
             best = np.zeros((b, w), np.int64)
             best[:, ::2] = self.tok
             return best, np.ones((b, w), np.float32), np.full(b, w)
 
     class Script:  # lines wider than 300 px "hold hanzi"
-        def run(self, _, feed, run_options=None):
+        def run(self, _, feed):
             return [(feed["widths"] > 300).astype(np.float32)]
 
     ocr = OrtOCR.__new__(OrtOCR)
@@ -139,7 +139,7 @@ def test_a_turned_page_is_turned_upright_before_detection():
     from indra_ocr.pipeline import OrtOCR
 
     class Orient:  # says: content turned one quarter turn counter-clockwise
-        def run(self, _, feed, run_options=None):
+        def run(self, _, feed):
             assert feed["x"].shape == (1, 1, 768, 768)
             return [np.array([[0.01, 0.97, 0.01, 0.01]], np.float32)]
 
@@ -265,7 +265,7 @@ def test_a_vertical_page_reads_columns_as_lines_and_maps_boxes_back():
     from indra_ocr.pipeline import Line, OrtOCR, Page
 
     class Orient:  # five classes: the page is set in vertical columns
-        def run(self, _, feed, run_options=None):
+        def run(self, _, feed):
             return [np.array([[0.01, 0.0, 0.0, 0.01, 0.98]], np.float32)]
 
     seen = {}
@@ -290,3 +290,65 @@ def test_a_vertical_page_reads_columns_as_lines_and_maps_boxes_back():
     assert page.vertical and page.rotation == 0
     # (x, y) -> (W - y, x) with W = 300: the column runs down x 260-280, y 100-400.
     assert page.lines[0].box == [260.0, 100.0, 280.0, 400.0]
+
+
+def test_rejected_font_run_rereads_a_partly_populated_line(monkeypatch):
+    from types import SimpleNamespace
+    from indra_ocr import document, textlayer
+
+    def run(text, x0, seq):
+        chars = [(c, (x0 + 5*i, 2, x0 + 5*(i+1), 8)) for i, c in enumerate(text)]
+        return textlayer.TextLine((x0, 2, x0 + 5*len(text), 8), text, chars, seq=seq)
+
+    good = run("prefix", 0, 0)
+    bad = run("bad\x00word", 40, 1)
+    layer = textlayer.TextLayer([good], (100, 20), True, rejected=[bad])
+    seen = []
+    class OCR:
+        vocab = SimpleNamespace(index={c: 1 for c in "abcdefghijklmnopqrstuvwxyz"})
+        groups = {}
+        math = None
+        def detect(self, gray): return np.array([[0, 0, 100, 10, 1]], np.float32)
+        def _decode(self, tokens): return "".join(t[0] for t in tokens)
+        def recognize(self, gray, boxes, **kwargs):
+            seen.extend(boxes.tolist())
+            return [("prefix repaired word", 1., [])]
+        def assemble(self, size, boxes, rec, times, **kwargs):
+            return SimpleNamespace(lines=[], blocks=[], note="", text=[r[0] for r in rec])
+
+    monkeypatch.setattr(document, "_render", lambda *args: np.zeros((20, 100), np.uint8))
+    page = SimpleNamespace(get_size=lambda: (100, 20))
+    result = document.Converter(OCR(), dpi=72)._text_page(page, layer, {}, check=False)
+    assert result.text == ["prefix repaired word"]
+    assert len(seen) == 1 and result.source == "hybrid"
+    # A caller that disables hybrid OCR must fall back instead of silently
+    # returning only the prefix from the trusted portion of the text layer.
+    assert document.Converter(OCR(), dpi=72, image_ocr=False)._text_page(page, layer, {}) is None
+
+
+def test_sound_text_layer_keeps_rejected_run_geometry_for_ocr(monkeypatch):
+    from types import SimpleNamespace
+    from indra_ocr import textlayer
+
+    good = textlayer.TextLine((0, 0, 20, 10), "good")
+    bad = textlayer.TextLine((20, 0, 40, 10), "\x00")
+    monkeypatch.setattr(textlayer, "invisible_text_frac", lambda page: 0)
+    monkeypatch.setattr(textlayer, "extract_runs", lambda *args: ([good, bad], {"bad": 1, "chars": 8}))
+    monkeypatch.setattr(textlayer, "visual_rtl_frac", lambda *args: (0, 0))
+    monkeypatch.setattr(textlayer, "no_ink_frac", lambda *args: 0)
+    page = SimpleNamespace(get_size=lambda: (100, 100))
+    layer = textlayer.read_text_layer(page, np.zeros((100, 100), np.uint8), 1.)
+    assert layer.trusted and layer.lines == [good] and layer.rejected == [bad]
+
+
+def test_bad_codes_mixed_with_words_do_not_make_the_rest_of_the_font_trustworthy(monkeypatch):
+    from types import SimpleNamespace
+    from indra_ocr import textlayer
+
+    good = textlayer.TextLine((0, 0, 20, 10), "remaining")
+    bad = textlayer.TextLine((20, 0, 40, 10), "word\x00")
+    monkeypatch.setattr(textlayer, "invisible_text_frac", lambda page: 0)
+    monkeypatch.setattr(textlayer, "extract_runs", lambda *args: ([good, bad], {"bad": 1, "chars": 13}))
+    page = SimpleNamespace(get_size=lambda: (100, 100))
+    layer = textlayer.read_text_layer(page, np.zeros((100, 100), np.uint8), 1.)
+    assert not layer.trusted and layer.reason == textlayer.BROKEN_FONT_MAP

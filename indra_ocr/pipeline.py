@@ -14,6 +14,7 @@ a page turned by a quarter or half turn is turned upright before detection
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import unicodedata
@@ -23,10 +24,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .det_post import decode, page_to_input
-from .layout_post import page_blocks, page_markdown
+from . import native
+from .ctc import lm_inputs, peak_prob
+from .det_post import OUT_STRIDE, decode, page_to_input
+from .layout_post import TABLE, page_blocks, page_markdown, split_blocks
 from .line_mask import crop_lines, line_darkness
-from .math import MATH_MIN_CONF, MathReader
+from .math import MathReader, latin_line
+from .math_span_img import Formula, unspliced
 from .order_post import (
     BLOCK_CLASSES,
     GRID_LABELS,
@@ -36,49 +40,76 @@ from .order_post import (
     order_xycut,
     xycut_blocks,
 )
-from .rec_preproc import PAD_X, pad_batch, width_batches
+from .table_rel import read_table, words_of
+from .table_verify import TableVerifier
+from .rec_preproc import PAD_X, pad_batch, widen, width_batches
+from .rot_gate import read_rotated
 from .rtl import flip, has_rtl, is_rtl
 from .vocab import Vocab
+from .ort_session import session
 
 ADAPTIVE_MIN_H = (
     9.0  # median line height (input px) that triggers a second detection pass
 )
 ADAPTIVE_TARGET_H = 12.0
-# Gaps between CTC character positions (centres), in line heights.  The label
+# Gaps between CTC character positions (centres), in line heights.  The cut
 # rules (2.5 and 1.0 line heights) measure glyph edges; centres add about half a
 # line height of glyph width.
-SPLIT_GAP = 3.0  # cut a detected line at a wider gap (label rule outside tables)
-CELL_GAP = 1.8  # cut a table line into cells at a wider gap (label rule in tables)
+SPLIT_GAP = 3.0  # cut a detected line at a wider gap (outside tables)
+CELL_GAP = 1.8  # cut a table line into cells at a wider gap (in tables)
 GUTTER_GAP = 1.6  # cut at a smaller gap when other lines' edges line up with it (a column gutter)
 GUTTER_EDGES = 3  # how many other line edges must line up (within half a line height)
 ADAPTIVE_MAX_SIDE = 2048
+# Large pages (plans, posters): when the lines of a page whose long side is over
+# TILE_MIN_SIDE px are still under ADAPTIVE_MIN_H after the adaptive pass, the page
+# is detected again in overlapping tiles at TILE_SCALE (a 200 dpi render -> 150
+# dpi), where the whole-page pass sees small text at 30-60 dpi.  Only tiles over
+# text-bearing regions of the whole-page pass run (its text probability over
+# TILE_REGION_P).
+TILE_MIN_SIDE = 4096
+TILE_SCALE = 0.75
+TILE = 1024  # detector input side per tile
+TILE_OVERLAP = 128  # detector input px shared by neighbouring tiles
+TILE_REGION_P = 0.15
 ORIENT_SIDE = 768  # orient.onnx input: page thumbnail, long side, padded square
 # A turn is applied only above this probability: real pages are almost all upright,
-# and a wrong turn loses the page.  Measured (orient_v1): 2 of 1,000 upright eval
-# pages turned at 0.95 (13 at 0.5), 101 of the 164 Omni Parse Bench pages with
-# rotated tests turned (128 at 0.5).
+# and a wrong turn loses the page.
 ORIENT_MIN = 0.95
 VERTICAL = 4  # orient.onnx class (5-class models): the page is set in vertical columns
+# When orient.onnx is unsure but puts at least this much probability on "text runs top to
+# bottom" (a quarter turn either way, or vertical columns), a few lines are read as the page
+# stands and turned each way, and the reading the recognizers are surest of picks the turn.  At a thumbnail, vertical CJK
+# columns and a page turned a quarter turn look alike: only the characters tell them apart.
+SIDEWAYS_MASS = 0.8
+SIDEWAYS_LINES = 8  # lines read per candidate turn
+# A half turn is checked the same way before it is made: the longest lines are read
+# as the page stands and turned half round, and the reading the recognizers are surer
+# of wins.  orient.onnx can turn an upright book scan half round above
+# orient_min (issue #32); the recognizers tell the two apart, since a line read upside down gets a low confidence.
 
 
 # A recognized line under this confidence (mean CTC peak probability) gets no
 # text: on empty form fields, checkboxes and rules the recognizer reads "-", "I"
 # or "1" at low confidence.  The line's box stays (layout and reading order).
 MIN_CONF = 0.5
+# hw.onnx: a base line goes to rec_hw at this handwritten probability or more.
+HW_ROUTE_MIN = 0.5
 
 # Beam search with a language model (lm.npz for the base recognizer, optional
 # lm_<group>.npz for a group) reads a recognizer's lines under this confidence;
 # the rest keep the greedy reading.  alpha weighs the LM, beta rewards each token
-# (tuned on held-out handwriting; meta.json "lm_params" overrides them per group).
+# (meta.json "lm_params" overrides them per group).
 LM_GATE = 0.9
 LM_ALPHA = 0.5
 LM_BETA = 1.5
 LM_BEAM = 8
-# A class under this probability at a step is not tried by the beam search
-# (1e-2 cost 0.2 OPB handwriting points; 3e-3 changes no OPB score).
+# A class under this probability at a step is not tried by the beam search.
 LM_CAND_FLOOR = 3e-3
 OUT_GREEDY = ["ids", "conf", "lengths"]
 OUT_LM = ["blank", "topv", "topi"]
+# A newer recognizer ends at these: the package computes the confidence and the
+# LM inputs from the logits, only where it uses them (ctc.py).
+OUT_LOGITS = ["ids", "lengths", "logits"]
 
 # Recognizer groups, in script.onnx's class order unless meta.json names them
 # ("script_groups", e.g. base and world).  base is rec.onnx.  An older
@@ -86,9 +117,7 @@ OUT_LM = ["blank", "topv", "topi"]
 GROUPS = ("base", "cjk", "rtl", "other")
 
 # A line goes to one recognizer when the classifier is surer than this; otherwise
-# base reads it as well and the more confident reading wins.  Measured
-# (script_w2, eval lines): every Latin line sent elsewhere was under 0.95, and
-# 3.4% of the right non-base lines are read twice.
+# base reads it as well and the more confident reading wins.
 ROUTE_SURE = 0.95
 
 # det.onnx picture channel: a region is a picture above this probability and
@@ -97,6 +126,52 @@ PICTURE_MIN = 0.5
 PICTURE_MIN_AREA = 0.004
 DESKEW_MAX = 45.0  # degrees of tilt searched (quarter turns cover the rest)
 DESKEW_MIN = 0.3  # smaller tilts are left alone (the search step is 0.1)
+
+
+THUMB_H, THUMB_W = 16, 64  # order.onnx line thumbnails
+
+
+def line_thumbs(
+    gray: np.ndarray,
+    boxes,
+    ctx: float = 0.25,
+    th: int = THUMB_H,
+    tw: int = THUMB_W,
+    interp: str = "area",
+) -> np.ndarray:
+    """[N, 1, th, tw] float32 thumbnails of line boxes (pixels of ``gray``): the box with ``ctx``
+    line heights above and below, scaled to th rows with its aspect kept (cut at tw), ink = 1;
+    interp "area" (cv2.INTER_AREA) or "linear".  The order model expects exactly these thumbnails."""
+    import cv2
+
+    mode = cv2.INTER_LINEAR if interp == "linear" else cv2.INTER_AREA
+    out = np.zeros((len(boxes), 1, th, tw), np.float32)
+    H, W = gray.shape[:2]
+    for i, b in enumerate(boxes):
+        x0, y0, x1, y1 = (float(v) for v in b[:4])
+        h = max(2.0, y1 - y0)
+        a, z = int(max(0, y0 - ctx * h)), int(min(H, y1 + ctx * h))
+        c, d = int(max(0, x0)), int(min(W, x1))
+        if z - a < 2 or d - c < 1:
+            continue
+        crop = gray[a:z, c:d]
+        w = max(1, min(tw, round(crop.shape[1] * th / crop.shape[0])))
+        r = cv2.resize(crop, (w, th), interpolation=mode)
+        out[i, 0, :, :w] = (255.0 - r) / 255.0
+    return out
+
+
+def _has_logits(sess) -> bool:
+    """Whether a recognizer ends at its logits (OUT_LOGITS), not at the CTC outputs."""
+    outs = getattr(sess, "get_outputs", None)  # test doubles may have no outputs list
+    return outs is not None and any(o.name == "logits" for o in outs())
+
+
+def _lm_ready(sess) -> bool:
+    """Whether a recognizer gives what the beam search reads: the top-k outputs
+    (OUT_LM) or the logits."""
+    outs = {o.name for o in sess.get_outputs()}
+    return set(OUT_LM) <= outs or "logits" in outs
 
 
 def _ink_thumb(gray: np.ndarray, side: int) -> np.ndarray:
@@ -124,7 +199,9 @@ def _row_sharpness(ink: np.ndarray, a: float) -> float:
 def estimate_skew(gray: np.ndarray, side: int = 800, pool=None) -> float:
     """Degrees (counter-clockwise) that straighten the text rows of a page: the
     angle whose horizontal ink profile changes most sharply row to row.  Searched
-    over +-DESKEW_MAX in 2 degree steps on a half-size thumbnail; the two best
+    over +-DESKEW_MAX in 2 degree steps on a small thumbnail (3/16 of ``side``: on
+    895 test pages, upright and tilted up to 44 degrees, the same angle as a
+    half-size one but on one page, which it reads better); the two best
     angles and 0 are then refined in 0.5 and 0.1 degree steps on the full
     thumbnail (``side`` pixels), where small text rows are still resolved.
     pool: a thread pool that scores the angles in parallel (same result)."""
@@ -132,7 +209,7 @@ def estimate_skew(gray: np.ndarray, side: int = 800, pool=None) -> float:
     fine = _ink_thumb(gray, side)
     if fine.mean() < 0.003 * 255:  # a blank page has no rows to straighten
         return 0.0
-    coarse = _ink_thumb(gray, side // 2)
+    coarse = _ink_thumb(gray, side * 3 // 16)
     grid = np.arange(-DESKEW_MAX, DESKEW_MAX + 1e-6, 2.0)
     scores = list(run(lambda a: _row_sharpness(coarse, a), grid))
     starts = {0.0, *(float(grid[i]) for i in np.argsort(scores)[-2:])}
@@ -214,10 +291,20 @@ def orient_input(gray: np.ndarray, side: int = ORIENT_SIDE) -> np.ndarray:
 
 
 @dataclass
+class Word:
+    box: list[float]  # x0, y0, x1, y1 in image pixels (the line's height)
+    text: str
+
+
+@dataclass
 class Line:
     box: list[float]  # x0, y0, x1, y1 in image pixels
     text: str
     conf: float
+    # with load(words=True): the line's words in reading order; a word's x
+    # extent comes from where the recognizer (or text layer) placed its
+    # characters, its y extent is the line's
+    words: list[Word] | None = None
 
 
 @dataclass
@@ -252,36 +339,33 @@ class Page:
         return [b["bbox"] for b in self.blocks if b["label"] == "Picture"]
 
 
-def gpu_run_options(providers: list):
-    """RunOptions for sessions on a GPU: give the arena's free memory back after
-    every run.  None on CPU.
+def quarter_turns(rotation: int) -> int:
+    """Quarter turns for ``rotation`` degrees (a multiple of 90; Page.rotation's
+    sense: counter-clockwise turn of the content, undone before reading)."""
+    if isinstance(rotation, bool) or not isinstance(rotation, (int, np.integer)) or rotation % 90:
+        raise ValueError(f"rotation must be a multiple of 90 degrees, not {rotation!r}")
+    return int(rotation) // 90 % 4
 
-    ONNX Runtime's CUDA provider keeps the largest allocation each session ever
-    needed (its BFC arena never shrinks on its own), and the line batches change
-    shape with every page, so a process grows until the device is full.  119
-    mixed pages on an A100 (onnxruntime-gpu 1.19.2): 0.57 GB after loading,
-    2.1 GB after the run and held for good; in a service with 8 workers on a
-    16 GB T4, one worker reached 5.2 GB and pages failed with CUDA OOM.  With
-    ``memory.enable_memory_arena_shrinkage`` on each run the same 119 pages
-    idle at 0.66 GB (peak 1.7 GB while a page runs), at the same speed (4.7
-    vs 4.5 pages/s).  The CPU arena is off instead (enable_cpu_mem_arena
-    above), which this does not touch.  The device is the provider's
-    ``device_id`` (0 by default)."""
-    for p in providers:
-        name, opts = (p, {}) if isinstance(p, str) else (p[0], p[1] or {})
-        if name == "CUDAExecutionProvider":
-            import onnxruntime as ort
 
-            ro = ort.RunOptions()
-            ro.add_run_config_entry(
-                "memory.enable_memory_arena_shrinkage", f"gpu:{opts.get('device_id', 0)}"
-            )
-            return ro
-    return None
+def _top_k(logits: np.ndarray, n: int, k: int = 8):
+    """The blank's log-probability and the k most likely classes (log-probabilities,
+    best first) per frame, from a recognizer's logits (B, T, C); frames after n
+    are left out."""
+    x = logits[:, :n].astype(np.float32)
+    m = x.max(-1, keepdims=True)
+    lse = m + np.log(np.exp(x - m).sum(-1, keepdims=True))
+    top = np.argpartition(-x, k - 1, axis=-1)[..., :k]
+    v = np.take_along_axis(x, top, axis=-1)
+    order = np.argsort(-v, axis=-1)
+    return (
+        x[..., 0] - lse[..., 0],
+        np.take_along_axis(v, order, axis=-1) - lse,
+        np.take_along_axis(top, order, axis=-1),
+    )
 
 
 class OrtOCR:
-    ro = None  # RunOptions for every run: arena shrinkage on a GPU (gpu_run_options)
+    orient_min = ORIENT_MIN
 
     def __init__(
         self,
@@ -293,13 +377,29 @@ class OrtOCR:
         providers: list | None = None,
         furniture: bool = False,
         math: bool = False,
+        math_spans: bool = False,
+        math_rescore: bool = False,
+        orient_min: float = ORIENT_MIN,
+        rot_gate: bool | None = None,
+        words: bool = False,
     ):
         """table_heads: build tables from the order model's row / column / cell
         heads (when it has them) instead of from geometry.  furniture: keep page
         headers and footers in the markdown (dropped by default).  math: read lines
-        with math as LaTeX (math.py; needs the math models; off by default).  providers: ONNX
+        with math as LaTeX (math.py; needs the math models; off by default).  math_spans:
+        with math, also inline math inside text-layer lines (math_span.py, when the
+        model folder has math_span.onnx; off by default).  math_rescore: with math, a
+        beam search re-reads lines MathRec is unsure of (math.py; off by default).  providers: ONNX
         Runtime execution providers (default CPU; e.g. ["CUDAExecutionProvider",
-        "CPUExecutionProvider"] with onnxruntime-gpu)."""
+        "CPUExecutionProvider"] with onnxruntime-gpu).  orient_min: the orient.onnx
+        probability above which a page is turned without reading lines each way
+        (read_turn).  rot_gate: read quarter-turned text lines on OCR pages (rot_gate.py;
+        off by default; None follows INDRA_ROT_GATE=1).  words: give each line its
+        words with boxes (Line.words; off by default)."""
+        if not 0.0 <= orient_min <= 1.0:
+            raise ValueError(f"orient_min must be in [0, 1], not {orient_min!r}")
+        self.orient_min = orient_min
+        self.words = words
         self.table_heads = table_heads
         self.furniture = furniture
         import onnxruntime as ort
@@ -322,7 +422,6 @@ class OrtOCR:
         # scan peaked at 4.9 GB), and it bought no measurable speed.
         so.enable_cpu_mem_arena = False
         prov = providers or ["CPUExecutionProvider"]
-        self.ro = gpu_run_options(prov)  # passed to every run (None on CPU)
 
         def need(name: str) -> str:
             p = onnx_dir / name
@@ -332,27 +431,36 @@ class OrtOCR:
 
         if rec_int8 is None:
             rec_int8 = (onnx_dir / "rec.int8.onnx").exists()
-        self.det = ort.InferenceSession(need("det.onnx"), so, providers=prov)
+        self.det = session(need("det.onnx"), so, providers=prov)
         self._pic = None  # the last page's picture channel, (logit map, scale)
-        self.rec = ort.InferenceSession(
-            need("rec.int8.onnx" if rec_int8 else "rec.onnx"), so, providers=prov
-        )
+        self.rec = session(need("rec.int8.onnx" if rec_int8 else "rec.onnx"), so, providers=prov)
         self.mask = (
-            ort.InferenceSession(str(onnx_dir / "mask.onnx"), so, providers=prov)
+            session(str(onnx_dir / "mask.onnx"), so, providers=prov)
             if (onnx_dir / "mask.onnx").exists()
             else None
         )
         self.order = (
-            ort.InferenceSession(str(onnx_dir / "order.onnx"), so, providers=prov)
+            session(str(onnx_dir / "order.onnx"), so, providers=prov)
             if (onnx_dir / "order.onnx").exists()
             else None
         )
+        # an order model that also reads line thumbnails
+        self._order_thumbs = self.order is not None and "thumbs" in {
+            i.name for i in self.order.get_inputs()
+        }
         self.orient = (
-            ort.InferenceSession(str(onnx_dir / "orient.onnx"), so, providers=prov)
+            session(str(onnx_dir / "orient.onnx"), so, providers=prov)
             if (onnx_dir / "orient.onnx").exists()
             else None
         )
         meta = json.loads(Path(need("meta.json")).read_text(encoding="utf-8"))
+        # line thumbnails for the order model: size from its "thumbs" input, resize mode
+        # from meta.json (absent: area)
+        self._thumb = (THUMB_H, THUMB_W, meta.get("order_thumbs_interp", "area"))
+        if self._order_thumbs:
+            shp = next(i.shape for i in self.order.get_inputs() if i.name == "thumbs")
+            if isinstance(shp[-2], int) and isinstance(shp[-1], int):
+                self._thumb = (shp[-2], shp[-1], self._thumb[2])
         self.vocab = Vocab.from_json(meta["vocab"])
         # Scripts: a line classifier routes each line to its group's recognizer
         # (rec_<group>.onnx with meta["vocab_<group>"]), in script.onnx's class
@@ -362,17 +470,29 @@ class OrtOCR:
         for g in [k[len("vocab_") :] for k in meta if k.startswith("vocab_")]:
             if (onnx_dir / f"rec_{g}.onnx").exists():
                 self.groups[g] = (
-                    ort.InferenceSession(
-                        str(onnx_dir / f"rec_{g}.onnx"), so, providers=prov
-                    ),
+                    session(str(onnx_dir / f"rec_{g}.onnx"), so, providers=prov),
                     Vocab.from_json(meta[f"vocab_{g}"]),
                 )
+        # A group recognizer that reads widened lines gets its crops widened by
+        # meta["rec_xscale_<group>"] (rec_preproc.widen), keyed by its session.
+        self.xscale = {
+            id(sess): float(meta.get(f"rec_xscale_{g}", 1.0))
+            for g, (sess, _) in self.groups.items()
+        }
         if self.groups and (onnx_dir / "script.onnx").exists():
-            self.script = ort.InferenceSession(
-                str(onnx_dir / "script.onnx"), so, providers=prov
-            )
+            self.script = session(str(onnx_dir / "script.onnx"), so, providers=prov)
         # Math: a line classifier routes lines with math to MathRec (math.py).
-        self.math = MathReader.load(onnx_dir, so, prov, self.ro) if math else None
+        self.math = MathReader.load(onnx_dir, so, prov) if math else None
+        # Math spans inside text-layer lines (math_span.py), optional.
+        from .math_span import SpanTagger
+
+        self.math_span = SpanTagger.load(onnx_dir, so, prov) if math and math_spans else None
+        # Inline math in lines MathRec does not read whole (math_span_img.py), optional.
+        from .math_span_img import SpanImgTagger
+
+        self.math_span_img = SpanImgTagger.load(onnx_dir, so, prov) if math else None
+        if self.math is not None:
+            self.math.rescore = math_rescore
         if math and self.math is None:
             raise FileNotFoundError(f"math=True needs the math models in {onnx_dir}")
         self.long_side = meta["det_long_side"]
@@ -380,17 +500,80 @@ class OrtOCR:
         # rec.onnx may read a tall window (the line and the page around it);
         # the classifiers and group recognizers read the line band only.
         self.window = meta.get("rec_window", 1)
+        # Handwriting (optional): rec_hw.onnx, a larger recognizer with
+        # the base vocab and its own input height and window, reads the base lines
+        # that hw.onnx (a printed/handwritten classifier on the line band) calls
+        # handwritten.  INDRA_HW_ROUTE=all sends every base line to it, =none none.
+        self.rec_hw = (
+            session(str(onnx_dir / "rec_hw.onnx"), so, providers=prov)
+            if (onnx_dir / "rec_hw.onnx").exists()
+            else None
+        )
+        self.hw_height = meta.get("rec_hw_height", self.height)
+        self.hw_window = meta.get("rec_hw_window", self.window)
+        self.hw_cls = (
+            session(str(onnx_dir / "hw.onnx"), so, providers=prov)
+            if self.rec_hw is not None and (onnx_dir / "hw.onnx").exists()
+            else None
+        )
+        self.hw_route_min = meta.get("hw_route_min", HW_ROUTE_MIN)
+        # Table structure (optional): tsr_rel.onnx gives, for the words of a table
+        # block, which share a cell, a row or a column (table_rel.py).  meta.json
+        # "tsr_rel_layer": false keeps the geometric tables for PDF text layers.
+        # INDRA_TSR=0 keeps the geometric tables everywhere.
+        self.tsr_rel_layer = bool(meta.get("tsr_rel_layer", True))
+        # "tsr_rel_span": "rel" takes a cell's columns from the model's same-column
+        # relations (group headers over several columns) instead of its geometry;
+        # "rel2" does the same for rows (stub headers over several header rows).
+        self.tsr_rel_span = str(meta.get("tsr_rel_span", "geo"))
+        self.tsr_rel = (
+            session(str(onnx_dir / "tsr_rel.onnx"), so, providers=prov)
+            if (onnx_dir / "tsr_rel.onnx").exists() and os.environ.get("INDRA_TSR", "1") != "0"
+            else None
+        )
+        # tsr_split.onnx (optional): row / column separator maps of a table crop, read
+        # as extra word features by a tsr_rel.onnx that takes them (table_rel.py).
+        self.tsr_split = (
+            ort.InferenceSession(str(onnx_dir / "tsr_split.onnx"), so, providers=prov)
+            if self.tsr_rel is not None and (onnx_dir / "tsr_split.onnx").exists()
+            else None
+        )
+        # tsr_refine.onnx (optional): refines the tsr_rel word tags (table_rel.py).
+        # Without the file, tables are as before.
+        self.tsr_refine = (
+            ort.InferenceSession(str(onnx_dir / "tsr_refine.onnx"), so, providers=prov)
+            if self.tsr_rel is not None and (onnx_dir / "tsr_refine.onnx").exists()
+            else None
+        )
+        # False-table verifier (optional): table_verify.json relabels Table blocks it
+        # calls false tables (table_verify.py).  INDRA_TABLE_VERIFY=0 turns it off.
+        # The file holds a weight set for OCR-read pages and, optionally, one for text-layer pages.
+        self.table_verify, self.table_verify_layer = (
+            TableVerifier.load(onnx_dir / "table_verify.json")
+            if (onnx_dir / "table_verify.json").exists() and os.environ.get("INDRA_TABLE_VERIFY", "1") != "0"
+            else (None, None)
+        )
+        # Rotated lines on upright pages (rot_gate.py): opt-in (load(rot_gate=True) or INDRA_ROT_GATE=1).
+        self.rot_gate = os.environ.get("INDRA_ROT_GATE", "0") == "1" if rot_gate is None else bool(rot_gate)
+        # rotcls.onnx (optional): the column classifier in front of the turned reads
+        self.rot_cls = (
+            session(str(onnx_dir / "rotcls.onnx"), so, providers=prov)
+            if (onnx_dir / "rotcls.onnx").exists()
+            else None
+        )
+        self.hw_conf_gate = meta.get("hw_conf_gate")
+        self.hw_min = meta.get("hw_min", 0.0)  # script.onnx hw class threshold
         # Language models: lm.npz for rec.onnx, lm_<group>.npz for a group's
-        # recognizer.  Each needs its recognizer's top-k outputs (newer exports).
-        # meta.json "lm_params" may set a group's alpha, beta and gate (tuned
-        # with the model); the defaults are the base recognizer's.
+        # recognizer.  Each needs its recognizer's top-k or logits outputs.
+        # meta.json "lm_params" may set a group's alpha, beta and gate; the
+        # defaults are the base recognizer's.
         self.lms: dict = {}  # id(session) -> (NgramLM, alpha, beta, gate)
         params = meta.get("lm_params", {})
         for name, sess in [("base", self.rec)] + [
             (g, s) for g, (s, _) in self.groups.items()
         ]:
             f = onnx_dir / ("lm.npz" if name == "base" else f"lm_{name}.npz")
-            if f.exists() and set(OUT_LM) <= {o.name for o in sess.get_outputs()}:
+            if f.exists() and _lm_ready(sess):
                 from .lm import NgramLM
 
                 p = params.get(name, {})
@@ -400,14 +583,108 @@ class OrtOCR:
                     p.get("beta", LM_BETA),
                     p.get("gate", LM_GATE),
                 )
+        if self.rec_hw is not None and id(self.rec) in self.lms:
+            if _lm_ready(self.rec_hw):
+                self.lms[id(self.rec_hw)] = self.lms[id(self.rec)]
         self.lm = self.lms.get(id(self.rec), (None,))[0]
         self.adaptive = adaptive
 
     def _detect_at(self, gray: np.ndarray, long_side: int):
         x, s = page_to_input(gray, long_side)
-        out = self.det.run(None, {"x": x[None, None]}, self.ro)[0][0]
+        self._det_in = (x, s)  # the ink map at the detector's scale (rot_gate reuses it)
+        out = self.det.run(None, {"x": x[None, None]})[0][0]
         self._pic = (out[3], s) if out.shape[0] > 3 else None
+        self._prob = (out[0], s)  # text logit at OUT_STRIDE of the detector input
         return decode(out), s
+
+    def _detect_tiled(self, gray: np.ndarray) -> np.ndarray:
+        """Line boxes [N, 5] in page pixels from overlapping TILE x TILE detector
+        inputs at TILE_SCALE.  Each tile keeps the boxes whose centre lies in its
+        own core (the tile minus half the overlap on every inner side); a line cut
+        by a core edge comes back in pieces from two tiles, and pieces from
+        different tiles that share a text row and touch are joined."""
+        logit, s = self._prob
+        region = cv2.dilate(
+            (logit > np.log(TILE_REGION_P / (1 - TILE_REGION_P))).astype(np.uint8),
+            np.ones((5, 5), np.uint8),
+        )
+        h, w = gray.shape
+        k = TILE_SCALE
+        step = TILE - TILE_OVERLAP
+        span = TILE / k  # page px per tile
+        sh, sw = int(np.ceil(h * k)), int(np.ceil(w * k))
+        ys = list(range(0, max(1, sh - TILE_OVERLAP), step))
+        xs = list(range(0, max(1, sw - TILE_OVERLAP), step))
+        found = []
+        for ty in ys:
+            for tx in xs:
+                # page box of this tile, and the same box on the region map
+                py0, px0 = ty / k, tx / k
+                py1, px1 = min(h, py0 + span), min(w, px0 + span)
+                r = region[
+                    int(py0 * s / OUT_STRIDE) : int(np.ceil(py1 * s / OUT_STRIDE)) + 1,
+                    int(px0 * s / OUT_STRIDE) : int(np.ceil(px1 * s / OUT_STRIDE)) + 1,
+                ]
+                if not r.any():
+                    continue
+                crop = gray[int(py0) : int(np.ceil(py1)), int(px0) : int(np.ceil(px1))]
+                x, cs = page_to_input(crop, int(round(max(crop.shape) * k)))
+                out = self.det.run(None, {"x": x[None, None]})[0][0]
+                b = decode(out)
+                if not len(b):
+                    continue
+                b[:, :4] = b[:, :4] / cs
+                b[:, [0, 2]] += px0
+                b[:, [1, 3]] += py0
+                # the core: half the overlap in from every edge that has a neighbour
+                m = TILE_OVERLAP / 2 / k
+                cx0 = px0 + (m if tx > 0 else -1e9)
+                cy0 = py0 + (m if ty > 0 else -1e9)
+                cx1 = px1 - (m if tx + step < sw - TILE_OVERLAP else -1e9)
+                cy1 = py1 - (m if ty + step < sh - TILE_OVERLAP else -1e9)
+                cx, cy = (b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2
+                keep = (cx >= cx0) & (cx < cx1) & (cy >= cy0) & (cy < cy1)
+                for row in b[keep]:
+                    lh = row[3] - row[1]
+                    # a piece that reaches a core edge may continue in the next tile
+                    edge = (
+                        row[0] < cx0 + lh
+                        or row[2] > cx1 - lh
+                        or row[1] < cy0 + lh
+                        or row[3] > cy1 - lh
+                    )
+                    found.append(((ty, tx), list(row), bool(edge)))
+        if not found:
+            return np.zeros((0, 5), np.float32)
+        tiles = [t for t, _, _ in found]
+        boxes = [b for _, b, _ in found]
+        alive = [True] * len(boxes)
+        # join pieces of one line from two tiles: a shared text row (vertical
+        # overlap over half the lower box) and a horizontal gap under one line height
+        edge = [i for i, (_, _, e) in enumerate(found) if e]
+        for a in edge:
+            if not alive[a]:
+                continue
+            for c in edge:
+                if c == a or not alive[c] or tiles[c] == tiles[a]:
+                    continue
+                A, C = boxes[a], boxes[c]
+                hgt = min(A[3] - A[1], C[3] - C[1])
+                vov = min(A[3], C[3]) - max(A[1], C[1])
+                gap = max(A[0], C[0]) - min(A[2], C[2])
+                if hgt > 0 and vov > 0.5 * hgt and gap < hgt:
+                    boxes[a] = [
+                        min(A[0], C[0]),
+                        min(A[1], C[1]),
+                        max(A[2], C[2]),
+                        max(A[3], C[3]),
+                        max(A[4], C[4]),
+                    ]
+                    alive[c] = False
+        out = np.array([b for b, ok in zip(boxes, alive) if ok], np.float32)
+        out[:, [0, 2]] = out[:, [0, 2]].clip(0, w)
+        out[:, [1, 3]] = out[:, [1, 3]].clip(0, h)
+        return out
 
     def detect(self, gray: np.ndarray) -> np.ndarray:
         boxes, s = self._detect_at(gray, self.long_side)
@@ -426,6 +703,14 @@ class OrtOCR:
                 )
                 if ls > self.long_side:
                     boxes, s = self._detect_at(gray, ls)
+        if (
+            max(gray.shape) > TILE_MIN_SIDE
+            and len(boxes) >= 8
+            and float(np.median(boxes[:, 3] - boxes[:, 1])) < ADAPTIVE_MIN_H
+        ):
+            # the lines are still too small for the detector after the adaptive
+            # pass (a plan sheet): detect again in tiles at a higher scale
+            return self._detect_tiled(gray)
         if len(boxes):
             boxes[:, :4] /= s
             h, w = gray.shape
@@ -454,7 +739,7 @@ class OrtOCR:
         x from the CTC peak's timestep mapped back through the crop.  A line
         under MIN_CONF comes back empty.  vertical: the page is a vertical one
         turned a quarter turn (every line to the CJK recognizer)."""
-        # CenterMask first when the model folder has mask.onnx (same step as training)
+        # CenterMask first when the model folder has mask.onnx
         pool = getattr(self, "pool", None)
         window = getattr(self, "window", 1)
         # Light-on-dark is decided once per line box, for both crops.
@@ -463,12 +748,15 @@ class OrtOCR:
             gray, boxes[:, :4], self.height, self.mask, pool=pool, dark=dark
         )
         tall = (
-            crop_lines(gray, boxes[:, :4], self.height, window=window, pool=pool, dark=dark)
+            crop_lines(
+                gray, boxes[:, :4], self.height, window=window, pool=pool, dark=dark
+            )
             if window > 1
             else crops
         )
         out: list = [("", 0.0, [])] * len(crops)
         groups = [(self.rec, self.vocab, list(range(len(crops))), False)]
+        script_hw: list = []  # lines script.onnx calls handwritten (an "hw" class)
         if vertical and "cjk" in self.groups:
             # A vertical page's lines are CJK columns, characters on their side;
             # the CJK recognizer reads those (and the Latin set across them).
@@ -476,6 +764,7 @@ class OrtOCR:
             groups = [(sess, vocab, list(range(len(crops))), True)]
         elif self.script is not None and crops:
             names, sure = self.line_groups(crops, batch)
+            script_hw = [j for j, g in enumerate(names) if g == "hw"]
             # A line the classifier is not sure about is read by base as well;
             # the reading with the higher confidence wins (below).
             groups = [
@@ -489,106 +778,333 @@ class OrtOCR:
                 (sess, vocab, [j for j, g in enumerate(names) if g == name], True)
                 for name, (sess, vocab) in self.groups.items()
             ]
-        best_conf = [-1.0] * len(crops)
-        for sess, vocab, sel, as_chars in groups:
-            for part in width_batches([crops[j].shape[1] for j in sel], batch):
-                idx = [sel[i] for i in part]
-                src = tall if sess is self.rec else crops
-                arr, widths = pad_batch([src[j] for j in idx])
-                lm = getattr(self, "lms", {}).get(id(sess))
-                use_lm = lm is not None
-                res = sess.run(
-                    OUT_GREEDY + (OUT_LM if use_lm else []),
-                    {"x": arr, "widths": widths},
-                    self.ro,
-                )
-                best, pmax, lengths = res[:3]
-                stride = arr.shape[-1] / max(best.shape[1], 1)
-                for k, j in enumerate(idx):
-                    n = int(lengths[k])
-                    seq, pm = best[k, :n], pmax[k, :n]
-                    keep = (seq != 0) & np.concatenate([[True], seq[1:] != seq[:-1]])
-                    x0, y0, x1, y1 = (float(v) for v in boxes[j, :4])
-                    h = max(1.0, y1 - y0)
-                    ix0 = np.floor(x0 - PAD_X * h)
-                    cw = np.ceil(x1 + PAD_X * h) - ix0
-                    f = cw / crops[j].shape[1]
-                    t = np.nonzero(keep)[0]
-                    ids = seq[t].tolist()
-                    conf = float(pm[keep].mean()) if keep.any() else 0.0
-                    if use_lm and MIN_CONF <= conf < lm[3]:
-                        from .lm import beam_search
+        # Handwritten base lines go to rec_hw, with crops at its own height.  With
+        # meta.json hw_conf_gate, only base lines read under that confidence are
+        # classified (after the base read), so confident printed lines cost nothing.
+        hw_crops = hw_tall = None
+        rec_hw = getattr(self, "rec_hw", None)
+        gate = getattr(self, "hw_conf_gate", None)
 
-                        ids, steps = beam_search(
-                            res[3][k, :n],
-                            res[4][k, :n],
-                            res[5][k, :n],
-                            lm[0],
-                            lm[1],
-                            lm[2],
-                            LM_BEAM,
-                            cand_floor=LM_CAND_FLOOR,
+        def hw_crops_for(sel):
+            line = [None] * len(crops)
+            tl = [None] * len(crops)
+            sub = boxes[sel, :4]
+            sel_dark = None if dark is None else [dark[j] for j in sel]
+            for j, c in zip(
+                sel,
+                crop_lines(
+                    gray, sub, self.hw_height, self.mask, pool=pool, dark=sel_dark
+                ),
+            ):
+                line[j] = c
+            if self.hw_window > 1:
+                for j, c in zip(
+                    sel,
+                    crop_lines(
+                        gray,
+                        sub,
+                        self.hw_height,
+                        window=self.hw_window,
+                        pool=pool,
+                        dark=sel_dark,
+                    ),
+                ):
+                    tl[j] = c
+            else:
+                tl = line
+            return line, tl
+
+        if rec_hw is not None and gate is None and not vertical and crops:
+            hw = self.hw_lines(crops, batch)
+            base = groups[0]
+            moved = [j for j in base[2] if hw[j]]
+            if moved:
+                groups[0] = (
+                    base[0],
+                    base[1],
+                    [j for j in base[2] if not hw[j]],
+                    base[3],
+                )
+                groups.append((rec_hw, self.vocab, moved, False))
+                hw_crops, hw_tall = hw_crops_for(moved)
+        if script_hw and rec_hw is not None and hw_crops is None:
+            groups.append((rec_hw, self.vocab, script_hw, False))
+            hw_crops, hw_tall = hw_crops_for(script_hw)
+        best_conf = [-1.0] * len(crops)
+
+        def read(groups, force=False):
+            for sess, vocab, sel, as_chars in groups:
+                is_hw = rec_hw is not None and sess is rec_hw
+                line = hw_crops if is_hw else crops
+                for part in width_batches([line[j].shape[1] for j in sel], batch):
+                    idx = [sel[i] for i in part]
+                    src = hw_tall if is_hw else tall if sess is self.rec else crops
+                    xscale = getattr(self, "xscale", {}).get(id(sess), 1.0)
+                    arr, widths = pad_batch(widen([src[j] for j in idx], xscale))
+                    lm = getattr(self, "lms", {}).get(id(sess))
+                    use_lm = lm is not None
+                    feed = {"x": arr, "widths": widths}
+                    logits = None
+                    if _has_logits(sess):
+                        best, lengths, logits = sess.run(OUT_LOGITS, feed)
+                    else:
+                        res = sess.run(OUT_GREEDY + (OUT_LM if use_lm else []), feed)
+                        best, pmax, lengths = res[:3]
+                    stride = arr.shape[-1] / max(best.shape[1], 1)
+                    for k, j in enumerate(idx):
+                        n = int(lengths[k])
+                        seq = best[k, :n]
+                        keep = (seq != 0) & np.concatenate(
+                            [[True], seq[1:] != seq[:-1]]
                         )
-                        t = np.array(steps, np.int64)
-                    xs = (ix0 + (t + 0.5) * stride * f).tolist()
-                    # A group recognizer's ids mean nothing in self.vocab: its tokens
-                    # are characters, like the text-layer tokens.
-                    toks = (
-                        list(zip([vocab.chars[i - 1] for i in ids], xs))
-                        if as_chars
-                        else list(zip(ids, xs))
-                    )
-                    if conf <= best_conf[j]:
-                        continue
-                    best_conf[j] = conf
-                    out[j] = (
-                        (vocab.decode(ids), conf, toks)
-                        if conf >= MIN_CONF
-                        else ("", conf, [])
-                    )
+                        if logits is None:
+                            pm = pmax[k, :n][keep]
+                        else:
+                            pm = peak_prob(logits[k, :n][keep])
+                        x0, y0, x1, y1 = (float(v) for v in boxes[j, :4])
+                        h = max(1.0, y1 - y0)
+                        ix0 = np.floor(x0 - PAD_X * h)
+                        cw = np.ceil(x1 + PAD_X * h) - ix0
+                        f = cw / (line[j].shape[1] * xscale)
+                        t = np.nonzero(keep)[0]
+                        ids = seq[t].tolist()
+                        conf = float(pm.mean()) if keep.any() else 0.0
+                        if use_lm and MIN_CONF <= conf < lm[3]:
+                            from .lm import beam_search
+
+                            lmin = (
+                                lm_inputs(logits[k, :n], floor=LM_CAND_FLOOR)
+                                if logits is not None
+                                else (res[3][k, :n], res[4][k, :n], res[5][k, :n])
+                            )
+                            ids, steps = beam_search(
+                                *lmin,
+                                lm[0],
+                                lm[1],
+                                lm[2],
+                                LM_BEAM,
+                                cand_floor=LM_CAND_FLOOR,
+                            )
+                            t = np.array(steps, np.int64)
+                        xs = (ix0 + (t + 0.5) * stride * f).tolist()
+                        # A group recognizer's ids mean nothing in self.vocab: its
+                        # tokens are characters, like the text-layer tokens.
+                        toks = (
+                            list(zip([vocab.chars[i - 1] for i in ids], xs))
+                            if as_chars
+                            else list(zip(ids, xs))
+                        )
+                        if conf <= best_conf[j] and not force:
+                            continue
+                        best_conf[j] = conf
+                        out[j] = (
+                            (vocab.decode(ids), conf, toks)
+                            if conf >= MIN_CONF
+                            else ("", conf, [])
+                        )
+
+        read(groups)
+        if rec_hw is not None and gate is not None and not vertical and crops:
+            # Second pass: unsure base lines that the classifier calls handwritten.
+            unsure = [j for j in groups[0][2] if best_conf[j] < gate]
+            if unsure:
+                hw = self.hw_lines([crops[j] for j in unsure], batch)
+                moved = [j for j, h in zip(unsure, hw) if h]
+                if moved:
+                    hw_crops, hw_tall = hw_crops_for(moved)
+                    read([(rec_hw, self.vocab, moved, False)], force=True)
         if getattr(self, "math", None) is not None and crops:
-            math = [j for j, f in enumerate(self.math.flags(crops)) if f]
+            # MathRec reads a line whose reading is mostly Latin (a formula line may
+            # have gone to a group recognizer: Greek letters to rec_world), or a line
+            # whose letters its own vocabulary writes (a MathRec whose vocabulary has
+            # Chinese reads Chinese lines); any other line keeps its reading.  The
+            # classifier decides which of these hold math.
+            cand = [
+                j
+                for j in range(len(crops))
+                if out[j] is not None
+                and (latin_line(out[j][0]) or self.math.writes(out[j][0]))
+            ]
+            flags = self.math.flags([crops[j] for j in cand]) if cand else []
+            math = [j for j, f in zip(cand, flags) if f]
+            if math and self.math.gate_head is not None:
+                probs = [p for p, f in zip(self.math.last_probs, flags) if f]
+                drafts0 = [out[j][0] if out[j] is not None else "" for j in math]
+                keep = self.math.gate(probs, drafts0, len(cand), "ocr")
+                math = [j for j, k in zip(math, keep) if k]
             if math:
-                for j, (text, conf) in zip(math, self.math.read(gray, boxes[math])):
-                    # Only a confident reading with math replaces the line (one
-                    # token holds the whole line: it is never split).
-                    if "$" in text and conf >= MATH_MIN_CONF:
+                drafts = [out[j][0] if out[j] is not None else "" for j in math]
+                read = self.math.read(gray, boxes[math], drafts=drafts)
+                for j, (text, conf), draft in zip(math, read, drafts):
+                    # Only a confident reading with math replaces the line, with
+                    # the recognizer's accents in its prose (one token holds the
+                    # whole line: it is never split).
+                    rconf = out[j][1] if out[j] is not None else 0.0
+                    merged = self.math.accept(text, conf, draft, rconf)
+                    if merged is not None:
+                        self.math.accepted[merged] = (out[j], text, conf, draft, rconf)
                         xc = float(boxes[j, 0] + boxes[j, 2]) / 2
-                        out[j] = (text, 1.0, [(text, xc)])
+                        out[j] = (merged, 1.0, [(merged, xc)])
+            if getattr(self, "math_span_img", None) is not None and not vertical:
+                seen = set(cand)
+                self._read_span_img(gray, boxes, out, [j for j in range(len(crops)) if j not in seen])
         return out
 
-    def box_groups(self, gray: np.ndarray, boxes: np.ndarray) -> tuple[list[str], list[bool]]:
-        """line_groups for line boxes on the page (crops as recognize makes them);
-        every line is "base" when the model folder has no script.onnx."""
-        if self.script is None or not len(boxes):
-            return ["base"] * len(boxes), [False] * len(boxes)
+    def _read_span_img(self, gray: np.ndarray, boxes: np.ndarray, out: list, idx: list) -> None:
+        """Inline math in the lines idx (lines that MathRec does not read whole):
+        the image tagger marks math columns, MathRec reads each run's crop, and a
+        confident reading with math replaces the recognizer's characters there."""
+        from .math import MATH_MIN_CONF, has_math
+        from .math_span_img import page_x, splice
+
+        idx = [j for j in idx if out[j] is not None and out[j][2] and any(c.isalpha() for c in out[j][0])]
+        if not idx:
+            return
+        tagger = self.math_span_img
+        crops = crop_lines(gray, boxes[idx, :4], tagger.height)
+        jobs = []  # (line, page x0, page x1)
+        for j, c, found in zip(idx, crops, tagger.spans(crops)):
+            jobs += [(j, *page_x(boxes[j], c.shape[1], xs)) for xs in found]
+        if not jobs:
+            return
+        sb = np.array([[x0, boxes[j, 1], x1, boxes[j, 3]] for j, x0, x1 in jobs], np.float32)
+        for (j, x0, x1), (text, conf) in zip(jobs, self.math.read(gray, sb)):
+            t = text.strip()
+            # A run's reading must be one formula: the line keeps its own prose.
+            if conf < MATH_MIN_CONF or t.count("$") != 2 or not (t.startswith("$") and t.endswith("$")):
+                continue
+            if not (tagger.accept_plain or has_math(t)):
+                continue
+            toks = out[j][2]
+            if not isinstance(toks[0][0], str):  # main recognizer: vocab ids -> characters
+                toks = [(self.vocab.decode([tk[0]]) or " ", tk[1]) for tk in toks]
+            toks = splice(toks, x0, x1, t)
+            out[j] = ("".join(tk[0] for tk in toks), out[j][1], toks)
+
+    def layer_gaps(
+        self, gray: np.ndarray, boxes: np.ndarray, tokens: list[list]
+    ) -> list[tuple[float | None, float, str]]:
+        """Per line box and its text-layer tokens: (gap, conf, group).  gap: the
+        log-probability per token by which the box's recognizer (script.onnx
+        routes the crop) finds the text less likely than its own best reading
+        (``agree.forced_gap``).  A line the router is not sure of is also read by
+        each other recognizer that writes the layer's letters (``agree.writes``),
+        and the smallest gap counts.  conf: that recognizer's confidence in its
+        own reading (mean peak probability of its characters, as ``recognize``);
+        group: that recognizer ("base" or a model folder group: "world", "rtl"...).
+        gap None for a line read as math: the recognizer writes LaTeX where the
+        layer holds Unicode symbols, so the two do not compare."""
+        from .agree import forced_gaps, layer_text, target_ids, writes
+
+        if not len(boxes):
+            return []
         pool = getattr(self, "pool", None)
         window = getattr(self, "window", 1)
         dark = line_darkness(gray, boxes[:, :4], pool) if window > 1 else None
         crops = crop_lines(gray, boxes[:, :4], self.height, self.mask, pool=pool, dark=dark)
-        return self.line_groups(crops)
+        tall = (
+            crop_lines(gray, boxes[:, :4], self.height, window=window, pool=pool, dark=dark)
+            if window > 1
+            else crops
+        )
+        recs = {"base": (self.rec, self.vocab), **self.groups}
+        if self.script is not None:
+            names, sure = self.line_groups(crops)
+        else:
+            names, sure = ["base"] * len(crops), [True] * len(crops)
+        texts = {name: [layer_text(t, name == "rtl") for t in tokens] for name in recs}
+        cands = [
+            {g} | ({n for n, (_, v) in recs.items() if writes(texts[n][j], v)} if not s else set())
+            for j, (g, s) in enumerate(zip(names, sure))
+        ]
+        math_lines: set = set()
+        todo: list = []
+        for name, (sess, vocab) in recs.items():
+            sel = [j for j, c in enumerate(cands) if name in c]
+            if not sel:
+                continue
+            xscale = getattr(self, "xscale", {}).get(id(sess), 1.0)
+            arr, widths = pad_batch(
+                widen([(tall if sess is self.rec else crops)[j] for j in sel], xscale)
+            )
+            if any(o.name == "logits" for o in sess.get_outputs()):
+                best, lengths, logits = sess.run(["ids", "lengths", "logits"], {"x": arr, "widths": widths})
+                blank, topv, topi = _top_k(logits, int(lengths.max()))
+            else:
+                best, _, lengths, blank, topv, topi = sess.run(
+                    OUT_GREEDY + OUT_LM, {"x": arr, "widths": widths}
+                )
+            dollar = vocab.index.get("$")  # a math span opens: the reading is LaTeX
+            for k, j in enumerate(sel):
+                n = int(lengths[k])
+                if dollar is not None and (best[k, :n] == dollar).any():
+                    math_lines.add(j)
+                    continue
+                ids = target_ids(texts[name][j], vocab, visual=name == "rtl")
+                seq = best[k, :n]
+                keep = (seq != 0) & np.concatenate([[True], seq[1:] != seq[:-1]])
+                peak = np.exp(np.maximum(blank[k, :n], topv[k, :n, 0]))
+                conf = float(peak[keep].mean()) if keep.any() else 0.0
+                todo.append((j, conf, name, (blank[k, :n], topv[k, :n], topi[k, :n], ids)))
+        out: list[tuple[float | None, float, str]] = [(float("inf"), 0.0, g) for g in names]
+        for (j, conf, name, _), g in zip(todo, forced_gaps([it for *_, it in todo])):
+            if g < out[j][0]:
+                out[j] = (g, conf, name)
+        for j in math_lines:
+            out[j] = (None, 0.0, names[j])
+        return out
+
+    def hw_lines(self, crops: list, batch: int = 64) -> list[bool]:
+        """Per line crop (line band, base height), whether rec_hw reads it:
+        hw.onnx's handwritten probability at least meta.json hw_route_min
+        (default HW_ROUTE_MIN), or INDRA_HW_ROUTE."""
+        mode = os.environ.get("INDRA_HW_ROUTE", "")
+        if mode in ("all", "none"):
+            return [mode == "all"] * len(crops)
+        if self.hw_cls is None:
+            return [False] * len(crops)
+        out = [False] * len(crops)
+        for idx in width_batches([c.shape[1] for c in crops], batch):
+            arr, widths = pad_batch([crops[j] for j in idx])
+            p = self.hw_cls.run(None, {"x": arr, "widths": widths})[0]
+            for k, j in enumerate(idx):
+                out[j] = bool(p[k] >= self.hw_route_min)
+        return out
 
     def line_groups(self, crops: list, batch: int = 64) -> tuple[list[str], list[bool]]:
         """Per line crop, the group whose recognizer reads it (script.onnx), and
         whether the classifier is sure of it (probability over ROUTE_SURE); a
-        group without its recognizer goes to base."""
+        group without its recognizer goes to base.  A script.onnx with an "hw"
+        class (handwritten base-script lines) sends those to rec_hw.onnx."""
         out = ["base"] * len(crops)
         sure = [True] * len(crops)
         for idx in width_batches([c.shape[1] for c in crops], batch):
             arr, widths = pad_batch([crops[j] for j in idx])
-            p = self.script.run(None, {"x": arr, "widths": widths}, self.ro)[0]
+            p = self.script.run(None, {"x": arr, "widths": widths})[0]
             for k, j in enumerate(idx):
+                names = getattr(self, "script_groups", GROUPS)
+                pk_row = p[k]
+                if p.ndim > 1 and "hw" in names:
+                    # The hw class wins only at hw_min or more; otherwise the
+                    # line keeps the best of the script classes.
+                    h = names.index("hw")
+                    if pk_row[h] < getattr(self, "hw_min", 0.0):
+                        pk_row = pk_row.copy()
+                        pk_row[h] = -1.0
                 g = (
                     ("cjk" if p[k] > 0.5 else "base")
                     if p.ndim == 1
-                    else getattr(self, "script_groups", GROUPS)[int(p[k].argmax())]
+                    else names[int(pk_row.argmax())]
                 )
                 pk = (
                     max(float(p[k]), 1.0 - float(p[k]))
                     if p.ndim == 1
-                    else float(p[k].max())
+                    else float(pk_row.max())
                 )
-                out[j] = g if g in self.groups else "base"
+                keep = g in self.groups or (
+                    g == "hw" and getattr(self, "rec_hw", None) is not None
+                )
+                out[j] = g if keep else "base"
                 sure[j] = pk > ROUTE_SURE
         return out, sure
 
@@ -618,18 +1134,97 @@ class OrtOCR:
     def _is_space(self, tok) -> bool:
         return tok == " " or tok == self.vocab.index.get(" ")
 
+    def _order_texts(self, rec: list, texts: list) -> list:
+        """The texts the order and layout model reads: a line with a spliced formula
+        (math_span_img) as the recognizer read it, so blocks and tables stay as
+        without the formula."""
+        return [
+            self._decode(unspliced(r[2])) if r[2] and any(isinstance(t[0], Formula) for t in r[2]) else tx
+            for r, tx in zip(rec, texts)
+        ]
+
     def _decode(self, toks: list) -> str:
         """Text of tokens: (vocab id, x) from the main recognizer, (char, x) from a
         group recognizer (visual order: right-to-left text is flipped by the
         page direction), or (char, x, content index) from a PDF text layer."""
         if toks and isinstance(toks[0][0], str):
+            # A formula token (math_span_img) stays one left-to-right unit: a
+            # private-use character (strong LTR) holds its place through the flip.
+            forms = [tk[0] for tk in toks if isinstance(tk[0], Formula)]
+            if forms:
+                k = iter(range(len(forms)))
+                toks = [(chr(0xE000 + next(k)), *tk[1:]) if isinstance(tk[0], Formula) else tk for tk in toks]
             text = " ".join("".join(tk[0] for tk in toks).split())
             if len(toks[0]) == 2:
                 text = unicodedata.normalize("NFC", text)  # Hangul jamo -> syllables
                 if has_rtl(text):
                     text = flip(text, base_rtl=self._page_rtl or None)
+            for i, f in enumerate(forms):
+                text = text.replace(chr(0xE000 + i), f)
             return text
         return self.vocab.decode([tk[0] for tk in toks])
+
+    def table_blocks(self, gray, boxes, rec, order, layout, geo, from_layer=False) -> dict:
+        """HTML per table block (key: the block's line indices as a tuple) from
+        tsr_rel.onnx, plus "ms": the time spent.  A block the model cannot read
+        (fewer than two rows or columns) is left out: it gets the geometric table."""
+        t0 = time.perf_counter()
+        out: dict = {}
+        if from_layer and not self.tsr_rel_layer:
+            out["ms"] = 0.0
+            return out
+        mirror = bool(self._page_rtl)
+        for blk in split_blocks(order, layout[1]):
+            if len(blk) < 2 or int(layout[0][blk].sum(0).argmax()) != TABLE:
+                continue
+            html = read_table(
+                self.tsr_rel,
+                gray,
+                [(boxes[i, :4], unspliced(rec[i][2])) for i in blk],
+                self._is_space,
+                self._decode,
+                mirror,
+                self.tsr_rel_span,
+                self.tsr_split,
+                self.tsr_refine,
+            )
+            if html:
+                out[tuple(blk)] = html
+        out["ms"] = 1000 * (time.perf_counter() - t0)
+        return out
+
+    def line_words(self, box, rec) -> list[Word]:
+        """The words of one line (text, conf, tokens), in reading order.  A word is
+        a run of tokens between spaces; its box spans its characters' x positions
+        (as split_line cuts cells) at the line's height.  A line whose text is not
+        its tokens' text (the math reader replaced it) is one word."""
+        text, _, toks = rec
+        box = [round(float(v), 1) for v in box[:4]]
+        if not text:
+            return []
+        if not toks or self._decode(toks) != text:
+            return [Word(box, text)]
+        ws = [
+            Word([round(float(v), 1) for v in w["box"]], w["text"])
+            for w in words_of([(box, toks)], self._is_space, self._decode)
+        ]
+        # Reading order is the line text's order (tokens are in visual order from
+        # the recognizers and in content order from a text layer): each word of
+        # the text takes the first unused box with its text, left to right, or
+        # right to left on a right-to-left line.
+        strong = next((c for c in text if c.isalpha()), "")
+        if strong and is_rtl(strong):
+            ws.sort(key=lambda w: -w.box[2])
+        else:
+            ws.sort(key=lambda w: w.box[0])
+        out, used = [], [False] * len(ws)
+        for t in text.split():
+            k = next((j for j, w in enumerate(ws) if not used[j] and w.text == t), None)
+            if k is None:
+                return ws
+            used[k] = True
+            out.append(ws[k])
+        return out if all(used) else ws
 
     def split_line(
         self, box, toks: list, gap: float, at: list | None = None
@@ -641,16 +1236,28 @@ class OrtOCR:
         segs: list[list] = [[]]
         prev = None
         at = sorted(at or [])
-        for tk in toks:
-            x = tk[1]
-            if not self._is_space(tk[0]):
-                cut = prev is not None and (
-                    x - prev > gap * h or any(prev < c < x for c in at)
-                )
-                if cut:
-                    segs.append([])
-                prev = x
-            segs[-1].append(tk)
+        cuts = None
+        if native.lib is not None and isinstance(toks, list):
+            # the same cuts, found in C++: the tokens that start a new segment
+            try:
+                space = self.vocab.index.get(" ")
+                cuts = native.lib.split_points(toks, gap * h, at, space)
+            except Exception as e:  # noqa: BLE001  (the loop below finds them)
+                native.failed("split_points", e)
+        if cuts is not None:
+            bounds = [0, *cuts, len(toks)]
+            segs = [toks[a:b] for a, b in zip(bounds, bounds[1:])]
+        else:
+            for tk in toks:
+                x = tk[1]
+                if not self._is_space(tk[0]):
+                    cut = prev is not None and (
+                        x - prev > gap * h or any(prev < c < x for c in at)
+                    )
+                    if cut:
+                        segs.append([])
+                    prev = x
+                segs[-1].append(tk)
         if len(segs) == 1:
             return [(list(box[:4]), self._decode(toks), toks)]
         out = []
@@ -668,20 +1275,38 @@ class OrtOCR:
         return out
 
     def reading_order(
-        self, boxes: np.ndarray, texts: list[str], wh: tuple[int, int]
+        self,
+        boxes: np.ndarray,
+        texts: list[str],
+        wh: tuple[int, int],
+        gray: np.ndarray | None = None,
+        img_boxes: np.ndarray | None = None,
     ) -> tuple[list[int], tuple | None, np.ndarray | None]:
         """Reading order, (cls logits, same-block logits, table logits) when the
-        order model has layout heads, and the pairwise order logits."""
+        order model has layout heads, and the pairwise order logits.  An order
+        model with line thumbnails (input "thumbs") gets them from ``gray`` at
+        ``img_boxes`` (the boxes on the page image; ``boxes`` may be mirrored for
+        an RTL page); without ``gray`` its lines have no image (has_img 0)."""
         if len(boxes) < 2 or self.order is None:
             order = order_xycut(boxes[:, :4]) if len(boxes) else []
             return order, None, None
         f = line_features(boxes[:, :4], wh, texts)[None]
-        outs = self.order.run(
-            None, {"feats": f, "mask": np.ones((1, len(boxes)), bool)}, self.ro
-        )
+        feed = {"feats": f, "mask": np.ones((1, len(boxes)), bool)}
+        if getattr(self, "_order_thumbs", False):
+            n = len(boxes)
+            if gray is not None:
+                src = boxes if img_boxes is None else img_boxes
+                th, tw, interp = getattr(self, "_thumb", (THUMB_H, THUMB_W, "area"))
+                feed["thumbs"] = line_thumbs(gray, src[:, :4], th=th, tw=tw, interp=interp)[None]
+                feed["has_img"] = np.ones((1, n), np.float32)
+            else:
+                th, tw, _ = getattr(self, "_thumb", (THUMB_H, THUMB_W, "area"))
+                feed["thumbs"] = np.zeros((1, n, 1, th, tw), np.float32)
+                feed["has_img"] = np.zeros((1, n), np.float32)
+        outs = self.order.run(None, feed)
         if len(outs) >= 3:
             # Layout heads: blocks from the same-block head, lines inside a block by
-            # geometry, blocks by the order head (exact page order 0.68 -> 0.81 on eval).
+            # geometry, blocks by the order head.
             cls, same = outs[1][0], outs[2][0]
             # same row / column / cell logits, when asked for
             tab = outs[3][0] if len(outs) > 3 and self.table_heads else None
@@ -693,17 +1318,17 @@ class OrtOCR:
         """orient.onnx class probabilities for the page (None without the model)."""
         if self.orient is None:
             return None
-        return self.orient.run(None, {"x": orient_input(gray)[None, None]}, self.ro)[0][0]
+        return self.orient.run(None, {"x": orient_input(gray)[None, None]})[0][0]
 
     def orientation(self, gray: np.ndarray) -> int:
         """Quarter turns (counter-clockwise) the page content is turned by, from
         orient.onnx: 0 without the model or when no turn is more likely than
-        ORIENT_MIN; VERTICAL for a page set in vertical columns."""
+        orient_min; VERTICAL for a page set in vertical columns."""
         p = self.orientation_probs(gray)
         if p is None:
             return 0
         k = int(p.argmax())
-        return k if p[k] > ORIENT_MIN else 0
+        return k if p[k] > self.orient_min else 0
 
     def upright(
         self, gray: np.ndarray, turn: bool = True, k: int | None = None
@@ -744,23 +1369,82 @@ class OrtOCR:
             a = 0.0
         return gray, k, a
 
-    def __call__(self, gray: np.ndarray, turn: bool = True) -> Page:
+    def __call__(
+        self, gray: np.ndarray, turn: bool = True, rotation: int | None = None
+    ) -> Page:
         """OCR of a page image.  turn=False: the page is known to be upright (no
-        orient.onnx)."""
+        orient.onnx).  rotation: the page's content is known to be turned by this
+        many degrees counter-clockwise (0, 90, 180, 270; as Page.rotation reports
+        it): Indra turns it back and does not ask orient.onnx."""
         t0 = time.perf_counter()
         small = preview(gray)
         a = estimate_skew(small, pool=getattr(self, "pool", None))
         # The orientation model reads the page straightened by its row angle (a
         # tilted page could read as turned).
-        k = (
-            self.orientation(rotate_page(small, a) if abs(a) >= DESKEW_MIN else small)
-            if turn
-            else 0
-        )
+        k = 0
+        if rotation is not None:
+            k = quarter_turns(rotation)
+        elif turn:
+            p = self.orientation_probs(
+                rotate_page(small, a) if abs(a) >= DESKEW_MIN else small
+            )
+            if p is not None:
+                k = int(p.argmax())
+                if p[k] <= self.orient_min:
+                    sideways = float(p[1] + p[3] + (p[VERTICAL] if len(p) > VERTICAL else 0))
+                    k = self.read_turn(gray, a, small, p) if sideways >= SIDEWAYS_MASS else 0
+                elif k == 2:
+                    k = self.read_half_turn(gray, a, small)
         orient_ms = 1000 * (time.perf_counter() - t0)
         page = self._read(gray, k, a, small)
         page.timings["orient_ms"] += orient_ms
         return page
+
+    def read_turn(
+        self, gray: np.ndarray, a: float, small: np.ndarray | None, p: np.ndarray
+    ) -> int:
+        """The turn of a page orient.onnx is unsure of but sees as likely sideways
+        (probabilities ``p``): up to SIDEWAYS_LINES of the longest lines are read as the
+        page stands, turned counter-clockwise, and turned clockwise (the counter-clockwise
+        lines turned half round); the reading the recognizers are surest of picks the
+        side.  On the counter-clockwise side, a quarter turn (3) and vertical columns
+        (VERTICAL) give the same crops, so orient.onnx, which sees the characters'
+        shape, picks between them."""
+
+        def longest(img):
+            bx = self.detect(img)
+            return bx[np.argsort(-(bx[:, 2] - bx[:, 0]))[:SIDEWAYS_LINES]]
+
+        def conf(img, bx):
+            if not len(bx):
+                return 0.0
+            return float(np.mean([c for _, c, _ in self.recognize(img, bx)]))
+
+        up, _, _ = self._turn(gray, 0, a, small)
+        ccw, _, _ = self._turn(gray, 3, a, small)
+        sel = longest(ccw)
+        h, w = ccw.shape[:2]
+        cw = np.ascontiguousarray(ccw[::-1, ::-1])  # the page turned clockwise
+        sel_cw = sel.copy()
+        sel_cw[:, :4] = np.stack(
+            [w - sel[:, 2], h - sel[:, 3], w - sel[:, 0], h - sel[:, 1]], 1
+        )
+        side = VERTICAL if len(p) > VERTICAL and p[VERTICAL] > p[3] else 3
+        scores = {0: conf(up, longest(up)), 1: conf(cw, sel_cw), side: conf(ccw, sel)}
+        return max(scores, key=scores.get) if max(scores.values()) > 0 else 0
+
+    def read_half_turn(self, gray: np.ndarray, a: float, small: np.ndarray | None) -> int:
+        """2 when up to SIDEWAYS_LINES of the longest lines read surer with the page
+        turned half round than as it stands, else 0."""
+
+        def conf(img):
+            bx = self.detect(img)
+            bx = bx[np.argsort(-(bx[:, 2] - bx[:, 0]))[:SIDEWAYS_LINES]]
+            return float(np.mean([c for _, c, _ in self.recognize(img, bx)])) if len(bx) else 0.0
+
+        up, _, _ = self._turn(gray, 0, a, small)
+        down, _, _ = self._turn(gray, 2, a, small)
+        return 2 if conf(down) > conf(up) else 0
 
     def _read(
         self, gray: np.ndarray, k: int, a: float, small: np.ndarray | None = None
@@ -776,6 +1460,14 @@ class OrtOCR:
         vertical = k == VERTICAL
         rec = self.recognize(gray, boxes, vertical=vertical)
         t["rec_ms"] = 1000 * (time.perf_counter() - t0)
+        if getattr(self, "rot_gate", False) and not vertical and len(boxes):
+            # Rotated lines the upright detector cannot find (rot_gate.py); a page
+            # without a tall, narrow group of uncovered ink is read as before.
+            t0 = time.perf_counter()
+            boxes, rec = read_rotated(
+                self, gray, boxes, rec, pictures, MIN_CONF, cls=getattr(self, "rot_cls", None), det_in=getattr(self, "_det_in", None)
+            )
+            t["rot_ms"] = 1000 * (time.perf_counter() - t0)
         page = self.assemble(
             (gray.shape[1], gray.shape[0]),
             boxes,
@@ -783,6 +1475,7 @@ class OrtOCR:
             t,
             vertical=vertical,
             pictures=None if vertical else pictures,
+            gray=gray,
         )
         page.rotation, page.skew = (0 if vertical else 90 * k), round(skew, 2)
         page.vertical = vertical
@@ -790,6 +1483,8 @@ class OrtOCR:
             wh = (gray.shape[1], gray.shape[0])
             for ln in page.lines:
                 ln.box = unrotate_box(ln.box, skew, wh)
+                for w in ln.words or ():
+                    w.box = unrotate_box(w.box, skew, wh)
             for b in page.blocks:
                 b["bbox"] = unrotate_box(b["bbox"], skew, wh)
         if vertical:  # back on the page as it is: (x, y) -> (W - y, x)
@@ -800,6 +1495,8 @@ class OrtOCR:
 
             for ln in page.lines:
                 ln.box = back(ln.box)
+                for w in ln.words or ():
+                    w.box = back(w.box)
             for b in page.blocks:
                 b["bbox"] = back(b["bbox"])
         return page
@@ -812,11 +1509,17 @@ class OrtOCR:
         t: dict,
         vertical: bool = False,
         pictures: np.ndarray | None = None,
+        gray: np.ndarray | None = None,
+        from_layer: bool = False,
     ) -> Page:
         """Lines -> split at wide gaps -> reading order -> markdown.
 
         ``rec`` holds (text, confidence, tokens) per detected line.  ``vertical``:
-        the page is a vertical page turned a quarter turn (see ``upright``)."""
+        the page is a vertical page turned a quarter turn (see ``upright``).
+        ``gray``: the page the boxes are on; with tsr_rel.onnx, tables are read
+        with it (``table_blocks``).  ``from_layer``: the lines come from a PDF
+        text layer (meta.json "tsr_rel_layer": false leaves those tables to the
+        geometric assembly)."""
         t0 = time.perf_counter()
         # A right-to-left page: lines read right to left (_decode), and reading
         # order and markdown work on the page mirrored left to right, so the
@@ -833,7 +1536,7 @@ class OrtOCR:
             m[..., 0], m[..., 2] = width - b[..., 2], width - b[..., 0]
             return m
 
-        # Text-layer labels split a line at wide gaps; do the same (SPLIT_GAP).
+        # Split each line at wide gaps (SPLIT_GAP).
         nb, nrec = [], []
         cuts = self.gutter_cuts(boxes, rec) if len(boxes) else []
         for b, (text, conf, toks), at in zip(boxes, rec, cuts):
@@ -847,9 +1550,26 @@ class OrtOCR:
             self.vocab.index.get(" "),
         )
         texts = [r[0] for r in rec]
-        order, layout, _ = self.reading_order(geo(boxes), texts, wh)
+        order, layout, _ = self.reading_order(geo(boxes), self._order_texts(rec, texts), wh, gray, boxes)
+        pend = getattr(getattr(self, "math", None), "accepted", None)
+        if pend and layout is not None and self.math.accept_head is not None:
+            # The head sees the table class only now: a reading on a table line goes
+            # back to the plain line when the head rejects it there.
+            rec = list(rec)
+            in_table = layout[0].argmax(-1) == BLOCK_CLASSES.index("Table")
+            back = False
+            for i in np.flatnonzero(in_table):
+                q = pend.get(rec[i][0])
+                if q is not None and q[0] is not None and self.math.accept(*q[1:], in_table=1.0) is None:
+                    rec[i] = q[0]
+                    back = True
+            if back:
+                texts = [r[0] for r in rec]
+                order, layout, _ = self.reading_order(geo(boxes), self._order_texts(rec, texts), wh, gray, boxes)
+        if pend is not None:
+            pend.clear()
         if vertical and layout is not None:
-            # The order model saw no vertical pages: turned, their columns of
+            # The order model does not read vertical pages: turned, their columns of
             # short lines look like one table read row by row across tiers.
             # Blocks and order come from XY-cut instead, without grid classes.
             blocks = xycut_blocks(boxes[:, :4])
@@ -862,7 +1582,7 @@ class OrtOCR:
                 cls[:, BLOCK_CLASSES.index(c)] = -1e4
             layout = (cls, same, None)
         elif layout is not None and layout[2] is not None:
-            # The table heads learned one line per cell, but the detector can join
+            # The table heads expect one line per cell, but the detector can join
             # cells: split table lines into cells, then run the order model again.
             table_cls = BLOCK_CLASSES.index("Table")
             is_table = layout[0].argmax(-1) == table_cls
@@ -881,7 +1601,7 @@ class OrtOCR:
                     boxes = np.array(nb, np.float32).reshape(-1, 4)
                     rec = nrec
                     texts = [r[0] for r in rec]
-                    order, layout, _ = self.reading_order(geo(boxes), texts, wh)
+                    order, layout, _ = self.reading_order(geo(boxes), self._order_texts(rec, texts), wh, gray, boxes)
         note = "order=xycut" if vertical else "order=model"
         t["order_ms"] = 1000 * (time.perf_counter() - t0)
         t["total_ms"] = sum(v for k, v in t.items() if k != "total_ms")
@@ -890,6 +1610,7 @@ class OrtOCR:
                 [round(float(v), 1) for v in boxes[i, :4]],
                 rec[i][0],
                 round(rec[i][1], 4),
+                self.line_words(boxes[i], rec[i]) if getattr(self, "words", False) else None,
             )
             for i in order
         ]
@@ -898,7 +1619,7 @@ class OrtOCR:
             blocks = page_blocks(geo(boxes[:, :4]), texts, order, layout[0], layout[1])
             for b in blocks:  # back on the page as it is
                 b["bbox"] = [round(float(v), 1) for v in geo(np.array(b["bbox"]))]
-            # Inside tables, labels split cells at smaller gaps (CELL_GAP).
+            # Inside tables, lines split into cells at smaller gaps (CELL_GAP).
             cells = {
                 i: [
                     (list(geo(np.array(bx, np.float32))), tx)
@@ -907,6 +1628,35 @@ class OrtOCR:
                 for i in range(len(boxes))
             }
             has_pics = pictures is not None and len(pictures)
+            tables = (
+                self.table_blocks(gray, boxes, rec, order, layout, geo, from_layer)
+                if self.tsr_rel is not None and gray is not None and not vertical
+                else None
+            )
+            if tables:
+                t["table_ms"] = tables.pop("ms")
+            # Text-layer lines (from_layer) have other line geometry than OCR lines: they get their
+            # own weight set, and no check when the file has none (the OCR set rejected real tables there).
+            verifier = self.table_verify_layer if from_layer else self.table_verify
+            if verifier is not None and not vertical:
+                # The verifier reads line and cell texts: lines with a spliced formula
+                # as the recognizer read them (the formula is not a table feature).
+                vtexts = self._order_texts(rec, texts)
+                vcells = cells
+                if vtexts is not texts and any(a != b for a, b in zip(vtexts, texts)):
+                    vcells = {
+                        i: [(list(geo(np.array(bx, np.float32))), tx) for bx, tx, _ in self.split_line(boxes[i], unspliced(rec[i][2]), CELL_GAP)]
+                        if vtexts[i] != texts[i] else cells[i]
+                        for i in range(len(boxes))
+                    }
+                cls_v, tables = verifier.apply(
+                    geo(boxes[:, :4]), vtexts, order, layout[0], layout[1], layout[2], vcells, tables, gray
+                )
+                if cls_v is not layout[0]:  # some Table blocks were false tables: relabel them
+                    layout = (cls_v, layout[1], layout[2])
+                    blocks = page_blocks(geo(boxes[:, :4]), texts, order, layout[0], layout[1])
+                    for b in blocks:
+                        b["bbox"] = [round(float(v), 1) for v in geo(np.array(b["bbox"]))]
             md = page_markdown(
                 geo(boxes[:, :4]),
                 texts,
@@ -917,6 +1667,7 @@ class OrtOCR:
                 cells=cells,
                 tab=layout[2],
                 pictures=geo(pictures) if has_pics else None,
+                tables=tables,
             )
             if (
                 has_pics
@@ -952,8 +1703,8 @@ BULLETS = set("•◦▪▫●○■□‣⁃∙*")  # list markers (not dashes:
 ENUMERATOR = re.compile(
     r"(\d{1,3}|[A-Za-z])[.)]|\((\d{1,3}|[A-Za-z]|[ivxlcIVXLC]{1,5})\)"
 )
-# A list marker and its item's text are at most this many line heights apart:
-# the label rule (training labels cut a text-layer line only at wider gaps).
+# A list marker and its item's text are at most this many line heights apart
+# (the cut rule outside tables: a line is cut only at wider gaps).
 MARKER_GAP = 2.5
 
 

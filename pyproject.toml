@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "indra-ocr"
-version = "1.1.2"
+version = "1.2.0"
 description = "Fast CPU OCR: line detection, CTC recognition, reading order and markdown, on ONNX Runtime"
 readme = "README.md"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "MODEL_LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
   "numpy",

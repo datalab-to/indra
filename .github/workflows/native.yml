@@ -1,0 +1,101 @@
+# The optional C++ kernels (indra-ocr-native, in native/): wheels for Linux (x86_64,
+# aarch64), macOS (Apple silicon) and Windows, each tested with the full test suite
+# (the native tests compare every kernel with the Python code). A tag native-v0.2.0
+# attaches them to a GitHub release of this repository (nothing goes to
+# PyPI); the tag must match native/pyproject.toml. Pull requests that touch the
+# kernels build and test without releasing.
+#
+# Kernels first written by karanvora2599 (datalab-to/indra PRs #12 and #13).
+name: native
+
+on:
+  push:
+    tags: ["native-v*"]
+  pull_request:
+    paths: ["native/**", "indra_ocr/native.py", "tests/test_native*.py", ".github/workflows/native.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag against the declared version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          declared=$(python -c 'import tomllib; print(tomllib.load(open("native/pyproject.toml","rb"))["project"]["version"])')
+          tag=${GITHUB_REF_NAME#native-v}
+          if [ "$declared" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $declared in native/pyproject.toml" >&2
+            exit 1
+          fi
+
+      - name: Build and test the wheels
+        shell: bash
+        run: |
+          python -m pip install "cibuildwheel>=3,<4"
+          python -m cibuildwheel native --output-dir wheelhouse
+        env:
+          # 3.10 and 3.11 get their own wheels; one stable-ABI wheel covers 3.12+.
+          CIBW_BUILD: "cp310-* cp311-* cp312-*"
+          CIBW_SKIP: "*-musllinux_* *-win32 *_i686"
+          CIBW_ARCHS_MACOS: arm64
+          # Apple silicon runners. pikepdf builds from source on them and fails, and
+          # only one test needs it (it skips without it): left out on macOS.
+          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=14.0
+          CIBW_TEST_REQUIRES_MACOS: pytest pillow
+          CIBW_TEST_REQUIRES: pytest pillow pikepdf
+          # the package from this checkout, then every test: the native ones
+          # compare each kernel (every SIMD target the runner has) with the
+          # Python code it replaces
+          CIBW_TEST_COMMAND: >-
+            pip install {project} &&
+            python -c "import indra_ocr.native as n; assert n.lib is not None, n.status(); print(n.status(), n.lib.ctc_isas())" &&
+            pytest -q {project}/tests
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build --sdist native --out-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  release:
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/native-v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach the wheels to a release of this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+          --prerelease --title "indra-ocr-native ${GITHUB_REF_NAME#native-v}"
+          --notes "Optional C++ kernels for indra-ocr: pip install the wheel for your platform. Kernels first written by karanvora2599 (datalab-to/indra #12, #13)."

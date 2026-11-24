@@ -2,8 +2,7 @@
 trust them.
 
 A digital PDF already holds its text.  When the text layer is sound, reading it
-is faster than OCR and has no recognition errors.  The checks follow the rules
-that select the recognizer's own training labels:
+is faster than OCR and has no recognition errors.  The checks:
 
 - invisible text (render mode 3) marks an OCR layer over a scan;
 - replacement, private-use or control characters mark a broken font map;
@@ -25,6 +24,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import native
+
 MAX_INVISIBLE_FRAC = 0.05
 MAX_BAD_CHAR_FRAC = 0.005
 MAX_NO_INK_LINE_FRAC = 0.03
@@ -34,7 +35,7 @@ MAX_NO_INK_LINE_FRAC = 0.03
 MAX_VISUAL_RTL_FRAC = 0.25
 MIN_RTL_PAIRS = 20
 VISUAL_RTL = "right-to-left text in visual order"  # TextLayer.reason
-DARK = 160  # grey level below which a pixel counts as ink
+DARK = 224  # grey level below which a pixel counts as ink (a thin glyph at the 72 dpi check render is anti-aliased grey, not black)
 
 
 def bad_char_count(text: str) -> int:
@@ -58,6 +59,7 @@ class TextLine:
     chars: list = field(default_factory=list)  # (char, bbox) in PDF order
     quarter: int = 0  # quarter turns from upright in the (turned) frame
     seq: int | None = None  # position in the page's content order (all runs)
+    boxes: np.ndarray | None = None  # the chars' boxes [n, 4] (for the native kernels)
 
 
 @dataclass
@@ -68,6 +70,10 @@ class TextLayer:
     reason: str = ""  # why the layer is not trusted
     stats: dict = field(default_factory=dict)
     rotated: list[TextLine] = field(default_factory=list)  # runs at other quarter turns
+    rejected: list[TextLine] = field(default_factory=list)  # bad-code runs to read from pixels
+    # boxes (x0, y0, x1, y1, points, in the runs' frame) of digits that may be
+    # symbol glyphs: symbol_digit_boxes
+    symbol_boxes: np.ndarray | None = None
 
 
 def _device_affine(page) -> np.ndarray:
@@ -166,15 +172,25 @@ def extract_runs(
         # character (a page has few distinct ones).
         get_unicode, get_angle = R.FPDFText_GetUnicode, R.FPDFText_GetCharAngle
         get_box, raw_tp = R.FPDFText_GetCharBox, tp.raw
+        fast = None
+        if native.lib is not None:
+            try:
+                fast = _native_chars(tp, n, L, turn)
+            except Exception as e:  # noqa: BLE001  (the loop below runs instead)
+                native.failed("pdf_chars", e)
+        if fast is not None:
+            chars, raw, breaks, qs, n_chars, n_rot, n_bad, quarters = fast
+            n = 0  # the loop below has nothing left to do
+        else:
+            chars, raw, breaks = [], [], []  # breaks: run ends after these positions
+            qs: list = []  # each character's quarter turn relative to ``turn``
+            n_chars = n_rot = n_bad = 0
+            quarters = [0, 0, 0, 0]
         bl, br, bb, bt = (ctypes.c_double() for _ in range(4))
         pl, pr, pb, pt = (ctypes.byref(v) for v in (bl, br, bb, bt))
         upright: dict = {}
-        quarters = [0, 0, 0, 0]
         bad: dict = {}
-        chars, raw, breaks = [], [], []  # breaks: run ends after these positions
-        qs: list = []  # each character's quarter turn relative to ``turn``
         cur_q = 0
-        n_chars = n_rot = n_bad = 0
         low = False  # this index is the second half of a surrogate pair
         for i in range(n):
             if low:
@@ -258,7 +274,8 @@ def extract_runs(
     cuts = sorted(set(breaks + turns + [len(chars)]))
     start = 0
     for end in cuts:
-        seg = [(chars[i], tuple(boxes[i])) for i in range(start, end) if visible[i]]
+        sel = [i for i in range(start, end) if visible[i]]
+        seg = [(chars[i], tuple(boxes[i])) for i in sel]
         q = qs[start] if start < len(qs) else 0
         start = end
         ink = [bx for c, bx in seg if not c.isspace()]
@@ -279,8 +296,47 @@ def extract_runs(
             dy = abs(c0[-1][1] - c0[0][1])
             if dy > 2 * dx:
                 q = 1
-        runs.append(TextLine(box, text, seg, q, len(runs)))
+        runs.append(TextLine(box, text, seg, q, len(runs), boxes[sel]))
     return runs, stats
+
+
+def _native_chars(tp, n: int, L: np.ndarray, turn: int):
+    """extract_runs' character loop with the native kernels: pdfium's calls and
+    the loop run in C++, and the upright test runs here once per distinct angle.
+    Returns (chars, boxes [k, 4] as l, b, r, t, breaks, quarter turns, characters,
+    turned characters, bad characters, characters per quarter turn), or None
+    when anything is off: the Python loop then runs (and raises as it does)."""
+    import ctypes
+
+    import pypdfium2.raw as R
+
+    def addr(obj) -> int:
+        return ctypes.cast(obj, ctypes.c_void_p).value or 0
+
+    codes, angles, cbox, ok = native.lib.pdf_char_data(
+        addr(tp.raw),
+        n,
+        addr(R.FPDFText_GetUnicode),
+        addr(R.FPDFText_GetCharAngle),
+        addr(R.FPDFText_GetCharBox),
+    )
+    ua, inv = np.unique(angles, return_inverse=True)
+    qmap = np.empty(len(ua), np.int8)
+    for j, a in enumerate(ua.tolist()):
+        try:
+            q = _quarter(L @ np.array([math.cos(a), math.sin(a)]))
+        except (ValueError, OverflowError):  # a NaN angle
+            return None
+        qmap[j] = -1 if q is None else q
+    chars, qs, src, breaks, counted, n_chars, n_rot, quarters, err = (
+        native.lib.pdf_char_loop(codes, qmap[inv.reshape(-1)], ok, turn)
+    )
+    if err:
+        return None
+    u, cnt = np.unique(counted, return_counts=True)
+    n_bad = sum(bad_char_count(chr(c)) * k for c, k in zip(u.tolist(), cnt.tolist()))
+    text = chars.astype("<u4").tobytes().decode("utf-32-le")
+    return list(text), cbox[src], breaks, qs.tolist(), n_chars, n_rot, n_bad, quarters
 
 
 def visual_rtl_frac(runs: list[TextLine]) -> tuple[int, float]:
@@ -297,18 +353,38 @@ def visual_rtl_frac(runs: list[TextLine]) -> tuple[int, float]:
     return pairs, right / max(pairs, 1)
 
 
-def invisible_text_frac(page) -> float:
-    """Share of text objects drawn invisibly (an OCR layer) on a pypdfium2 page."""
+def invisible_text_frac(page, max_depth: int = 4) -> float:
+    """Share of text objects drawn invisibly (an OCR layer) on a pypdfium2 page,
+    form objects included down to ``max_depth`` levels (as
+    ``page.get_objects(max_depth=4)`` walks them, with raw pdfium calls)."""
+    import pypdfium2
     import pypdfium2.raw as R
 
+    TEXT, FORM = R.FPDF_PAGEOBJ_TEXT, R.FPDF_PAGEOBJ_FORM
+    INVISIBLE, get_type = R.FPDF_TEXTRENDERMODE_INVISIBLE, R.FPDFPageObj_GetType
+    get_mode = R.FPDFTextObj_GetTextRenderMode
     n = inv = 0
-    for obj in page.get_objects(max_depth=4):
-        if obj.type == R.FPDF_PAGEOBJ_TEXT:
-            n += 1
-            inv += (
-                R.FPDFTextObj_GetTextRenderMode(obj.raw)
-                == R.FPDF_TEXTRENDERMODE_INVISIBLE
-            )
+    todo = [(None, 0)]  # (form object or None for the page, level)
+    while todo:
+        form, level = todo.pop()
+        if form is None:
+            parent, get = page.raw, R.FPDFPage_GetObject
+            count = R.FPDFPage_CountObjects(parent)
+        else:
+            parent, get = form, R.FPDFFormObj_GetObject
+            count = R.FPDFFormObj_CountObjects(parent)
+        if count < 0:
+            raise pypdfium2.PdfiumError("Failed to get number of pageobjects.")
+        for i in range(count):
+            obj = get(parent, i)
+            if not obj:
+                raise pypdfium2.PdfiumError("Failed to get pageobject.")
+            t = get_type(obj)
+            if t == TEXT:
+                n += 1
+                inv += get_mode(obj) == INVISIBLE
+            elif t == FORM and level < max_depth - 1:
+                todo.append((obj, level + 1))
     return inv / n if n else 0.0
 
 
@@ -325,6 +401,87 @@ def no_ink_frac(gray: np.ndarray, runs: list[TextLine], scale: float) -> float:
             empty += 1
     return empty / max(len(runs), 1)
 
+
+def symbol_digit_boxes(page, frame: int = 0) -> np.ndarray:
+    """Boxes [n, 4] (x0, y0, x1, y1, points, in the frame turned by ``frame``) of
+    the digits that may be symbol glyphs: an ASCII digit (0-9) in a symbolic font
+    (PDF font flag 4), or an ASCII digit whose font differs from the fonts of the characters on
+    both sides of it in its word.  Some fonts give a symbol glyph a digit's code
+    and no Unicode map (one publisher's minus comes out '2', its plus-minus '6'),
+    drawn from a font other than the number's digits."""
+    import ctypes
+
+    import pypdfium2.raw as R
+
+    tp = page.get_textpage()
+    try:
+        n = R.FPDFText_CountChars(tp.raw)
+        uni = [R.FPDFText_GetUnicode(tp.raw, i) for i in range(n)]
+        buf = ctypes.create_string_buffer(128)
+        flags = ctypes.c_int()
+        fonts: dict = {}
+
+        def font(i):
+            f = fonts.get(i)
+            if f is None:
+                R.FPDFText_GetFontInfo(tp.raw, i, buf, len(buf), ctypes.byref(flags))
+                f = fonts[i] = (buf.value, flags.value)
+            return f
+
+        loose = R.FS_RECTF()
+
+        def height(i):
+            # the character's loose box: its drawn size, whatever the glyph's shape
+            R.FPDFText_GetLooseCharBox(tp.raw, i, ctypes.byref(loose))
+            return loose.top - loose.bottom
+
+        def seen(i, step, reach: int = 3):
+            # the nearest character that is not a space, within ``reach`` places
+            for d in range(1, reach + 1):
+                j = i + step * d
+                if not 0 <= j < n:
+                    return None
+                if not chr(uni[j]).isspace():
+                    return j
+            return None
+
+        def side(i, step):
+            j = i + step
+            if 0 <= j < n and not chr(uni[j]).isspace():
+                return j
+            return None
+
+        raw = []
+        x0, x1, y0, y1 = (ctypes.c_double() for _ in range(4))
+        for i, u in enumerate(uni):
+            if not 0x30 <= u <= 0x39:  # an ASCII digit code (what such a font falls back to)
+                continue
+            name, fl = font(i)
+            near = [j for j in (side(i, -1), side(i, 1)) if j is not None]
+            # a superscript or subscript digit (smaller than its neighbours) is a
+            # real digit set small, and too small to check against the page
+            # the size test looks past spaces (an exponent set apart: 'x 6')
+            sized = [j for j in (seen(i, -1), seen(i, 1)) if j is not None]
+            if sized and height(i) < 0.85 * max(height(j) for j in sized):
+                continue
+            if fl & 4 or (near and all(font(j)[0] != name for j in near)):
+                if R.FPDFText_GetCharBox(
+                    tp.raw, i, ctypes.byref(x0), ctypes.byref(x1), ctypes.byref(y0), ctypes.byref(y1)
+                ):
+                    raw.append((x0.value, y0.value, x1.value, y1.value))
+    finally:
+        tp.close()
+    if not raw:
+        return np.zeros((0, 4), np.float32)
+    A = _device_affine(page)
+    bb = np.asarray(raw, float)
+    xs, ys = bb[:, [0, 2, 0, 2]], bb[:, [1, 1, 3, 3]]
+    px = A[0, 0] * xs + A[0, 1] * ys + A[0, 2]
+    py = A[1, 0] * xs + A[1, 1] * ys + A[1, 2]
+    if frame:
+        W, H = page.get_size()
+        px, py = _turn_frame(px, py, W, H, frame)
+    return np.stack([px.min(1), py.min(1), px.max(1), py.max(1)], 1).astype(np.float32)
 
 def read_text_layer(
     page, gray: np.ndarray, scale: float, turn: int = 0, frame: int | None = None
@@ -346,8 +503,21 @@ def read_text_layer(
     runs = [r for r in runs if not r.quarter]
     if not runs:
         return TextLayer([], size, False, "no text layer", st, rotated)
+    rejected = []
     if st["bad"] > MAX_BAD_CHAR_FRAC * max(st["chars"], 1):
-        return TextLayer(runs, size, False, BROKEN_FONT_MAP, st, rotated)
+        # An isolated non-text run (e.g. a math extension font's bracket
+        # pieces) can use control/private-use codes. Keep its geometry for
+        # OCR, then let the recognizer check judge the remaining layer.
+        rejected, sound = [], []
+        for run in runs:
+            (rejected if bad_char_count(run.text) else sound).append(run)
+        st["bad_runs"] = len(rejected)
+        # Mixed word text and bad codes indicate a broken text encoding, not
+        # an isolated non-text symbol. Do not trust the remaining font runs:
+        # their ordinary Unicode characters can be wrong too (legacy fonts).
+        if not sound or any(c.isalpha() for r in rejected for c in r.text):
+            return TextLayer(runs, size, False, BROKEN_FONT_MAP, st, rotated)
+        runs = sound
     # Only upright text has a reading direction on the page (a vertical page read
     # turned does not).
     pairs, visual = visual_rtl_frac(runs) if frame == turn else (0, 0.0)
@@ -360,4 +530,10 @@ def read_text_layer(
         return TextLayer(
             runs, size, False, f"{empty:.0%} of text runs have no ink", st, rotated
         )
-    return TextLayer(runs, size, True, "", st, rotated)
+    out = TextLayer(runs, size, True, "", st, rotated, rejected)
+    try:
+        out.symbol_boxes = symbol_digit_boxes(page, frame)
+    except Exception:  # noqa: BLE001  (an odd font or object: no symbol check, the layer as is)
+        out.symbol_boxes = None
+    st["symbol_boxes"] = 0 if out.symbol_boxes is None else len(out.symbol_boxes)
+    return out

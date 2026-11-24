@@ -73,10 +73,14 @@ def test_batched_lookup_matches_single(tmp_path):
     single = [lm.logp(h, t) for h, t in pairs]
     keys = [(_pack(h) << 11) | (t + 1) for h, t in pairs]
     assert np.allclose(lm.logp_keys(keys), single)
+    # a few new keys at a time take the scalar path: the same numbers, bit for bit
+    batched = lm.logp_keys(keys)
+    lm.ikcache.clear()
+    assert [v for i in range(0, len(keys), 2) for v in lm.logp_keys(keys[i : i + 2])] == batched
 
 
 def _beam_reference(blank, topv, topi, lm, alpha, beta, beam, blank_skip=0.999, cand_floor=1e-3):
-    """beam_search without the floor that skips hopeless prefixes (0.4.0rc8)."""
+    """beam_search without the floor that skips hopeless prefixes (the older search)."""
     from indra_ocr.lm import _lse
 
     bits = lm.bits

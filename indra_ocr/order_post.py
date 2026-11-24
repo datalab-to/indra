@@ -1,7 +1,5 @@
 """Torch-free parts of the reading-order stage: line features, decoding,
-baselines, metrics, and the ground-truth order of a labelled page.
-
-order_model.py (the PyTorch OrderNet) re-exports all of these.
+baselines, metrics, and the reading order of a page with known blocks.
 """
 
 from __future__ import annotations
@@ -10,6 +8,8 @@ import math
 import unicodedata
 
 import numpy as np
+
+from . import native
 
 N_GEOM = 10
 N_TEXT = 6
@@ -210,12 +210,12 @@ def successor_acc(pred: list[int], n: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Ground-truth order from page labels
+# Reading order from known blocks
 # ---------------------------------------------------------------------------
 
 GRID_LABELS = {"Table", "Form", "Table-Of-Contents"}
 
-# Block classes the layout heads predict for each line (chandra block labels).
+# Block classes the layout heads predict for each line (the layout block classes).
 BLOCK_CLASSES = [
     "Text",
     "Section-Header",
@@ -232,14 +232,14 @@ _CLASS_ID = {c: i for i, c in enumerate(BLOCK_CLASSES)}
 
 
 def block_class(label: str) -> int:
-    """Class id of a chandra block label (unknown labels count as Text)."""
+    """Class id of a block class name (unknown names count as Text)."""
     return _CLASS_ID.get(label, 0)
 
 
 def label_order(lab: dict) -> list[int] | None:
-    """True reading order of a labelled page (indices into lab["lines"]).
+    """Reading order of a page whose lines carry their blocks (indices into lab["lines"]).
 
-    Blocks come in chandra's order.  Inside a table / form / table-of-contents
+    Blocks keep their given order.  Inside a table / form / table-of-contents
     block, lines go row by row.  Inside any other block, lines go by XY-cut,
     so a list or text block that spans two columns reads column by column
     (row order interleaved the columns).  Returns None when a line has no block."""
@@ -270,10 +270,16 @@ def _cluster(logits: np.ndarray) -> list[list[int]]:
 
     A merge changes only the merged group's row and column of the mean matrix,
     and each row keeps its best partner, so a page of n lines costs about n^2
-    instead of n^3 (an 800-line page: 1.5 s -> tens of ms)."""
+    instead of n^3 (an 800-line page: 1.5 s -> tens of ms).  With the native
+    kernels the same steps run in C++ (same groups)."""
     n = logits.shape[0]
     if n == 0:
         return []
+    if native.lib is not None:
+        try:
+            return native.lib.cluster(np.ascontiguousarray(logits, np.float64))
+        except Exception as e:  # noqa: BLE001  (the loop below runs instead)
+            native.failed("cluster", e)
     S = logits.astype(np.float64).copy()
     np.fill_diagonal(S, 0.0)
     size = np.ones(n)

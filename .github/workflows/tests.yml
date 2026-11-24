@@ -1,0 +1,23 @@
+# The Python test suite on every pull request. native.yml runs only when a PR touches
+# the C++ kernels (path filter), and publish.yml runs only on a tag or a manual run, so
+# a PR that changes only Python code had no check. The tests need no models and no network.
+name: tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Install and test
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[test]"
+          uv run --no-sync pytest -q

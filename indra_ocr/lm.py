@@ -8,7 +8,7 @@ score = log P_ctc + alpha * log P_lm + beta * tokens.  The recognizer's own
 probabilities still decide, so a clearly written odd word survives.
 
 lm.npz holds the model as a backoff table (no pickle): per history length n,
-sorted keys of the (history, token) pairs seen in training with their
+sorted keys of the (history, token) pairs the model holds, with their
 log-probabilities, and sorted history keys with their backoff weights.  A key
 packs tokens ``bits`` bits each (0 = line start, t + 1 = token t): 11 unless
 the file says more (a larger vocab), with order x bits at most TAG_SHIFT.
@@ -20,9 +20,12 @@ import math
 
 import numpy as np
 
+from . import native
+
 BITS = 11  # per token, unless lm.npz holds "bits"
 TAG_SHIFT = 61  # the history length goes in the top 3 bits
 BOS = -1
+SCALAR_KEYS = 4  # logp_keys looks up at most this many new keys one at a time
 
 
 def _pack(tokens, bits: int = BITS) -> int:
@@ -60,6 +63,26 @@ class NgramLM:
         self._masks = ((np.uint64(1) << (np.uint64(self.bits) * n)) - np.uint64(1))[
             None, :
         ]
+        self._native = None  # the C++ model over the same tables, made on first use
+
+    def __getstate__(self) -> dict:
+        # the native model points into this process's tables: rebuilt on demand
+        return {**self.__dict__, "_native": None}
+
+    def native_lm(self):
+        """The native kernels' NgramLM over these tables (same values as logp_keys)."""
+        if self._native is None:
+            self._native = native.lib.NgramLM(
+                self.order,
+                self.bits,
+                self.vocab_size,
+                self.p_keys,
+                self.p_vals,
+                self.h_keys,
+                self.h_vals,
+                self.max_logp,
+            )
+        return self._native
 
     @property
     def max_logp(self) -> float:
@@ -101,14 +124,60 @@ class NgramLM:
             self.cache[ck] = v
         return v
 
+    def _logp_key(self, key: int) -> float:
+        """logp_keys for one key, without the array set-up (the same table
+        searches, and the same float additions in the same order)."""
+        if not hasattr(self, "_hb0"):
+            i = self._find(self.h_keys, 0)  # the empty history
+            self._hb0 = float(self.h_vals[i]) if i >= 0 else 0.0
+            self._logv = math.log(self.vocab_size)
+        v = self.ikcache.get(key)
+        if v is not None:
+            return v
+        b, N = self.bits, self.order
+        ct = key & ((1 << b) - 1)
+        hist = key >> b
+        hkeys, pkeys = self.h_keys, self.p_keys
+        # x[n]: the backoff weight of the length-n history, for n <= m (the
+        # longest history the model has seen); m counts the seen lengths from 1.
+        x = [self._hb0]
+        hs = [0]
+        for n in range(1, N):
+            h = hist & ((1 << (b * n)) - 1)
+            q = np.uint64(h | (n << TAG_SHIFT))
+            j = int(hkeys.searchsorted(q))
+            if j >= len(hkeys) or hkeys[j] != q:
+                break
+            x.append(float(self.h_vals[j]))
+            hs.append(h)
+        m = len(x) - 1
+        acc = 0.0
+        for n in range(m, -1, -1):
+            q = np.uint64((hs[n] << b) | ct | (n << TAG_SHIFT))
+            j = int(pkeys.searchsorted(q))
+            if j < len(pkeys) and pkeys[j] == q:
+                v = acc + float(self.p_vals[j])
+                break
+            acc += x[n]
+        else:
+            v = acc - self._logv
+        if len(self.ikcache) < 1_000_000:
+            self.ikcache[key] = v
+        return v
+
     def logp_keys(self, keys: list[int]) -> list[float]:
         """logp for many (history, token) pairs, each given as one key: the
         last order - 1 history tokens and then the token, packed (``_pack``).
         Shorter histories are the key's low bits, so every history length
         is one vectorized search over all the pairs."""
-        out = [self.ikcache.get(k) for k in keys]
+        get = self.ikcache.get
+        out = [get(k) for k in keys]
         miss = [i for i, v in enumerate(out) if v is None]
         if not miss:
+            return out
+        if len(miss) <= SCALAR_KEYS:
+            for i in miss:
+                out[i] = self._logp_key(keys[i])
             return out
         N, P = self.order, len(miss)
         full = np.array([keys[i] for i in miss], np.uint64)[:, None]
@@ -175,80 +244,137 @@ def beam_search(
     log-probabilities; topv / topi: [T, k] the k best classes per step (blank
     included) and their log-probabilities; a class under ``cand_floor``
     probability at a step is not tried there.  Returns (token ids, the step
-    where each token was first emitted)."""
+    where each token was first emitted).  With the native kernels the same
+    search runs in C++ (same result: the same float64 steps and tie order)."""
+    if native.lib is not None and isinstance(lm, NgramLM):
+        try:
+            return native.lib.beam_search(
+                np.ascontiguousarray(blank, np.float32),
+                np.ascontiguousarray(topv, np.float32),
+                np.ascontiguousarray(topi, np.int64),
+                lm.native_lm(),
+                alpha,
+                beta,
+                beam,
+                blank_skip,
+                cand_floor,
+            )
+        except Exception as e:  # noqa: BLE001  (the search below runs instead)
+            native.failed("beam_search", e)
+    inf = math.inf
+    exp, log = math.exp, math.log
     bits = lm.bits
     hmask = (1 << (bits * (lm.order - 1))) - 1
-    # prefix -> (log p ending in blank, log p ending in non-blank, lm score,
-    # steps, the prefix's last order - 1 tokens packed)
-    beams: dict = {(): (0.0, -math.inf, 0.0, (), 0)}
-    log_skip = math.log(blank_skip)
-    log_floor = math.log(cand_floor)
-    for t in range(len(blank)):
-        b0 = float(blank[t])
+    # A prefix is a node of a token trie: node 0 is the empty prefix, node k
+    # extends node parent[k] by token[k]; trie maps (parent, token) -> node.
+    # (A tuple of tokens costs its length to hash and to extend.)
+    trie: dict = {}
+    parent, token = [-1], [-1]
+    # Beams in score order: (node, log p ending in blank, log p ending in
+    # non-blank, lm score, steps (linked: (step, earlier steps)), the prefix's
+    # last order - 1 tokens packed, log p of the prefix).  The log-sums are
+    # _lse, inlined.
+    beams = [(0, 0.0, -inf, 0.0, None, 0, 0.0)]
+    log_skip = log(blank_skip)
+    log_floor = log(cand_floor)
+    reach = beta + alpha * lm.max_logp
+    blank, topv, topi = blank.tolist(), topv.tolist(), topi.tolist()
+    for t, b0 in enumerate(blank):
         if b0 > log_skip:
-            beams = {
-                p: (_lse(e[0], e[1]) + b0, -math.inf, e[2], e[3], e[4])
-                for p, e in beams.items()
-            }
+            beams = [
+                (p, tot + b0, -inf, s, st, hk, tot + b0)
+                for p, b, nb, s, st, hk, tot in beams
+            ]
             continue
+        cands = [(c, v) for c, v in zip(topi[t], topv[t]) if c != 0 and v >= log_floor]
+        # node -> [log p ending in blank, in non-blank, lm score, steps, history]
         nxt: dict = {}
-
-        def add(prefix, b, nb, s, st, hk):
-            old = nxt.get(prefix)
-            if old is None:
-                nxt[prefix] = (b, nb, s, st, hk)
-            else:
-                nxt[prefix] = (_lse(old[0], b), _lse(old[1], nb), *old[2:])
-
-        cands = [
-            (int(c), float(v))
-            for c, v in zip(topi[t], topv[t])
-            if c != 0 and v >= log_floor
-        ]
         # Every beam's own entries first (the blank, and a repeat that collapses):
         # their scores only grow below, so with a full beam the lowest of them is
         # a floor; a new prefix that cannot reach it never enters the beam, and
         # its LM score is not looked up (the result is the same).
-        for prefix, (b, nb, s, st, hk) in beams.items():
-            add(prefix, _lse(b, nb) + b0, -math.inf, s, st, hk)
-            last = prefix[-1] if prefix else None
+        for p, b, nb, s, st, hk, tot in beams:
+            last = token[p]
+            rep = -inf
             for c, lp in cands:
                 if c == last:
-                    add(prefix, -math.inf, nb + lp, s, st, hk)
-        floor = (
-            min(_lse(e[0], e[1]) + e[2] for e in nxt.values())
-            if len(beams) >= beam
-            else -math.inf
-        )
-        reach = beta + alpha * lm.max_logp
-        ext = []  # (prefix, class, log p of the new token, lm score, steps, history)
-        for prefix, (b, nb, s, st, hk) in beams.items():
-            tot = _lse(b, nb)
-            last = prefix[-1] if prefix else None
+                    rep = nb + lp
+            nxt[p] = [tot + b0, rep, s, st, hk]
+        floor = -inf
+        if len(beams) >= beam:
+            for e in nxt.values():
+                x, y = e[0], e[1]
+                if y == -inf:
+                    v = x + e[2]
+                elif x == -inf:
+                    v = y + e[2]
+                else:
+                    m = x if x > y else y
+                    v = m + log(exp(x - m) + exp(y - m)) + e[2]
+                if v < floor or floor == -inf:
+                    floor = v
+        floor -= 1e-9  # float slack
+        ext = []  # (parent node, class, log p of the new token, lm score, steps, history)
+        for p, b, nb, s, st, hk, tot in beams:
+            last = token[p]
             for c, lp in cands:
                 # after a blank, the same class is a new token
                 new_from = b + lp if c == last else tot + lp
-                if new_from == -math.inf:
+                if new_from == -inf:
                     continue
-                q = prefix + (c,)
-                if q in nxt:  # an existing beam: merges, its LM score stays
-                    add(q, -math.inf, new_from, s, st, hk)
-                elif new_from + s + reach >= floor - 1e-9:  # float slack
-                    ext.append((prefix, c, new_from, s, st, hk))
-        lps = lm.logp_keys([(e[5] << bits) | (e[1] + 1) for e in ext]) if ext else []
-        for (prefix, c, new_from, s, st, hk), lmp in zip(ext, lps):
-            add(
-                prefix + (c,),
-                -math.inf,
-                new_from,
-                s + alpha * lmp + beta,
-                st + (t,),
-                ((hk << bits) | (c + 1)) & hmask,
-            )
-        beams = dict(
-            sorted(nxt.items(), key=lambda kv: -(_lse(kv[1][0], kv[1][1]) + kv[1][2]))[
-                :beam
-            ]
-        )
-    best = max(beams.items(), key=lambda kv: _lse(kv[1][0], kv[1][1]) + kv[1][2])
-    return list(best[0]), list(best[1][3])
+                q = trie.get((p, c))
+                old = nxt.get(q) if q is not None else None
+                if old is not None:  # an existing beam: merges, its LM score stays
+                    y = old[1]
+                    if y == -inf:
+                        old[1] = new_from
+                    else:
+                        m = y if y > new_from else new_from
+                        old[1] = m + log(exp(y - m) + exp(new_from - m))
+                elif new_from + s + reach >= floor:
+                    ext.append((p, c, new_from, s, st, hk))
+        if ext:
+            lps = lm.logp_keys([(e[5] << bits) | (e[1] + 1) for e in ext])
+            for (p, c, new_from, s, st, hk), lmp in zip(ext, lps):
+                q = trie.get((p, c))
+                if q is None:
+                    q = trie[(p, c)] = len(parent)
+                    parent.append(p)
+                    token.append(c)
+                nxt[q] = [
+                    -inf,
+                    new_from,
+                    s + alpha * lmp + beta,
+                    (t, st),
+                    ((hk << bits) | (c + 1)) & hmask,
+                ]
+        scored = []
+        for q, (x, y, s, st, hk) in nxt.items():
+            if y == -inf:
+                tot = x
+            elif x == -inf:
+                tot = y
+            else:
+                m = x if x > y else y
+                tot = m + log(exp(x - m) + exp(y - m))
+            scored.append((-(tot + s), (q, x, y, s, st, hk, tot)))
+        scored.sort(key=_first)
+        beams = [e for _, e in scored[:beam]]
+    best = max(beams, key=_score)
+    ids, steps = [], []
+    q, st = best[0], best[4]
+    while q > 0:
+        ids.append(token[q])
+        q = parent[q]
+    while st is not None:
+        steps.append(st[0])
+        st = st[1]
+    return ids[::-1], steps[::-1]
+
+
+def _first(kv):
+    return kv[0]
+
+
+def _score(e):
+    return e[6] + e[3]

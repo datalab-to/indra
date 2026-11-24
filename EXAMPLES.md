@@ -48,7 +48,7 @@ A Thai academic calendar, read by OCR (`--mode ocr`; the PDF also has a text lay
 
 <table>
 ...
-<tr><td>3. วันสำเร็จการศึกษา</td><td colspan="2">วันประชุมสภามหาวิทยาลัย รอบที่อนุมัติประกาศนียบัตรวิชาชีพ</td><td></td><td></td></tr>
+<tr><td>3. วันสำเร็จการศึกษา</td><td colspan="4">วันประชุมสภามหาวิทยาลัย รอบที่อนุมัติประกาศนียบัตรวิชาชีพ</td></tr>
 <tr><td>4. การลงทะเบียนและชำระเงิน</td><td></td><td></td><td></td><td>หมวด 2</td></tr>
 ...
 ```
@@ -72,7 +72,7 @@ We have updated the electronic version of OMB Circular No. A-11 to reflect some 
 
 The revised guidance:
 
-• Adds a reference to Executive Order 13893, “Increasing Government Accountability for Administrative Actions by Reinvigorating Administrative PAYGO,” which was released in October 2019 and OMB Memorandum M-20-06 (section 31.3).
+• Adds a reference to Executive Order 13893, "Increasing Government Accountability for Administrative Actions by Reinvigorating Administrative PAYGO," which was released in October 2019 and OMB Memorandum M-20-06 (section 31.3).
 ...
 ```
 
