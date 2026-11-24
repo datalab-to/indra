@@ -209,7 +209,10 @@ def orient_input(gray: np.ndarray, side: int = ORIENT_SIDE) -> np.ndarray:
         gray, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA
     )
     out = np.zeros((side, side), np.float32)
-    out[: small.shape[0], : small.shape[1]] = 1.0 - small.astype(np.float32) / 255.0
+    region = out[: small.shape[0], : small.shape[1]]
+    region[:] = small
+    region /= 255.0
+    np.subtract(1.0, region, out=region)
     return out
 
 
