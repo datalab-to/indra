@@ -1,0 +1,24 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "indra-ocr-cuda"
+version = "0.1.0"
+description = "Optional GPU engine for Indra OCR: the models on TensorRT, a page's data kept in VRAM"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# onnx and onnxconverter-common prepare the models for TensorRT (FP16 files) when
+# an engine is first built; the engines are cached after that.
+dependencies = ["numpy", "onnx", "onnxconverter-common"]
+
+[project.urls]
+Repository = "https://github.com/datalab-to/indra"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+cmake.build-type = "Release"
+wheel.packages = ["src/indra_ocr_cuda"]
+wheel.py-api = "cp312"

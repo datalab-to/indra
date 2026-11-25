@@ -38,6 +38,7 @@ WIDTH_BUCKETS = (
 )
 WIDTH_BEYOND = 2048  # wider batches: padded to a multiple of this
 PAD_WIDTH = 8  # the ``widths`` of a padding line
+ENGINE = "IndraCudaEngine"  # gpu.ENGINE: the pseudo-provider of load(device="cuda")
 
 _PRELOADED = False
 
@@ -196,6 +197,15 @@ def session(path, so, providers):
     with its batches padded to a few shapes (``_BucketedSession``)."""
     import onnxruntime as ort
 
+    if providers and providers[0] == ENGINE:
+        # load(device="cuda") with indra-ocr-cuda installed: the model on the
+        # engine when it runs it there, else on the providers after it
+        from . import gpu
+
+        providers = list(providers[1:])
+        s = gpu.session_for(path, so, providers)
+        if s is not None:
+            return s
     if not _on_cuda(providers):
         return ort.InferenceSession(str(path), so, providers=providers)
     _preload()

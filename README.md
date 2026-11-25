@@ -178,7 +178,24 @@ if __name__ == "__main__":                # worker processes re-import this file
 
 Without the `if __name__ == "__main__":` guard (needed on macOS and Windows), `convert_many` warns and reads everything in one process.
 
-`indra_ocr.load` takes `path` (model folder), `threads`, `dpi`, `mode`, `image_ocr`, `furniture` and `math`. `conv.convert` takes `max_pages` and `password`.
+`indra_ocr.load` takes `path` (model folder), `threads`, `dpi`, `mode`, `image_ocr`, `furniture`, `math` and `device`. `conv.convert` takes `max_pages` and `password`.
+
+## GPU
+
+```shell
+pip install "onnxruntime-gpu[cuda,cudnn]"            # instead of onnxruntime
+TENSORRT_ROOT=/path/to/TensorRT-11 pip install ./cuda  # optional: the GPU engine
+```
+
+```python
+conv = indra_ocr.load(device="cuda")      # or "cuda:1"
+```
+
+```shell
+indra-ocr paper.pdf --device cuda --cores 16   # 16 worker processes share the GPU
+```
+
+With `device="cuda"` the models run on the optional GPU engine (`cuda/`, the `indra-ocr-cuda` package: TensorRT engines on fixed device buffers, the recognizers' logits and the math decoder's caches kept on the GPU) where it is installed, and on ONNX Runtime's CUDA provider otherwise. The engine builds each model's TensorRT engine the first time it loads (10 to 40 seconds each) and caches it (`INDRA_TRT_CACHE`, default `~/.cache/indra-ocr/trt`). Pages read on the GPU can differ from the CPU's in a few characters (float rounding): 0.001% of the characters on 300 OmniParseBench pages. Throughput grows with worker processes, as on the CPU.
 
 ## Viewer
 
