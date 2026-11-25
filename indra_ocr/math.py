@@ -316,6 +316,8 @@ def latin_line(text: str) -> bool:
     its own reading.  A letter of another script on its own (a Greek variable) is a
     math symbol, not text: only runs of 2 or more such letters count.  A line
     without such text (numbers, symbols) may go."""
+    if text.isascii():  # no marks, and every letter is Latin
+        return True
     latin = other = run = 0
     for c in text + " ":
         if unicodedata.category(c).startswith("M"):
@@ -574,20 +576,27 @@ class MathReader:
             rows = np.arange(B)  # the batch's lines still decoding, in step order
             in_math = [False] * B  # inside a $...$ span
             text_like = [False] * B  # the reading already fails accept_math
+            # probs as one array: every line still decoding has a probability for
+            # each step so far, so one mean per step gives each line's (a row's
+            # mean is np.mean of its list, to the bit)
+            P = np.zeros((B, self.max_tokens), np.float64)
             for t in range(self.max_tokens - 1):
                 logits, sk, sv = self._step(tok, t, sk, sv, ck, cv, mask)
                 tok = logits.argmax(-1).astype(np.int64)
                 e = np.exp(logits - logits.max(-1, keepdims=True))
                 top = 1.0 / e.sum(-1)  # softmax probability of the argmax token
+                P[rows, t] = top
+                low = (
+                    P[rows, : t + 1].mean(1) < MATH_MIN_CONF - EARLY_STOP_MARGIN
+                    if t + 1 >= 8
+                    else np.zeros(len(rows), bool)
+                )
                 live = np.ones(len(rows), bool)
                 for r, b in enumerate(rows):
                     probs[b].append(float(top[r]))
                     if tok[r] == EOS:
                         live[r] = False
-                    elif (
-                        len(probs[b]) >= 8
-                        and np.mean(probs[b]) < MATH_MIN_CONF - EARLY_STOP_MARGIN
-                    ):
+                    elif low[r]:
                         live[r] = False  # rejected: keeps a low mean probability
                     elif tok[r] >= N_SPECIAL:
                         seqs[b].append(int(tok[r]))

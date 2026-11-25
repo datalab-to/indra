@@ -41,7 +41,8 @@ def _is_ltr(c: str) -> bool:
 
 
 def has_rtl(text: str) -> bool:
-    return any(is_rtl(c) for c in text)
+    # no ASCII character is right-to-left
+    return not text.isascii() and any(is_rtl(c) for c in text)
 
 
 def rtl_base(text: str) -> bool:
