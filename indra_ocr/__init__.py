@@ -23,6 +23,19 @@ __all__ = [
 __version__ = "1.2.0"
 
 
+def gpu_providers(device: str = "cuda") -> list:
+    """The providers load(device=...) gives the models: the GPU engine first
+    when indra-ocr-cuda is installed and sees a GPU, then ONNX Runtime's CUDA
+    provider, then the CPU."""
+    name, _, idx = device.partition(":")
+    if name != "cuda" or (idx and not idx.isdigit()):
+        raise ValueError(f"device must be cpu, cuda or cuda:N, not {device!r}")
+    cuda = ("CUDAExecutionProvider", {"device_id": int(idx or 0)})
+    from . import gpu
+
+    return ([gpu.ENGINE] if gpu.available() else []) + [cuda, "CPUExecutionProvider"]
+
+
 def load(
     path=None,
     threads: int = 4,
@@ -37,6 +50,7 @@ def load(
     orient_min: float = ORIENT_MIN,
     rot_gate: bool | None = None,
     words: bool = False,
+    device: str = "cpu",
 ) -> Converter:
     """A ready Converter (see ``Converter`` for the options).  mode="ocr" never
     reads the PDF text layer.  furniture: keep page headers and footers in the
@@ -52,7 +66,14 @@ def load(
     (axis labels, margin labels on drawings, vertical table headers) from ink that no
     upright line covers (rot_gate.py; off by default: it adds time on pages with
     such ink; None follows INDRA_ROT_GATE=1).  words: give each line its words with
-    boxes (Line.words: text and [x0, y0, x1, y1]; off by default)."""
+    boxes (Line.words: text and [x0, y0, x1, y1]; off by default).  device: "cpu",
+    or "cuda" / "cuda:N" for the GPU: the models on the indra-ocr-cuda engine where
+    it is installed (gpu.py), on ONNX Runtime's CUDA provider otherwise (needs
+    onnxruntime-gpu); not with providers."""
+    if device != "cpu":
+        if providers is not None:
+            raise ValueError("load: pass device or providers, not both")
+        providers = gpu_providers(device)
     return Converter(
         OrtOCR(
             model_dir(path, math=math),

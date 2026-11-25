@@ -399,6 +399,26 @@ def gate_features(prob: float, draft: str, n_flagged: int, pmax: float, n_cand: 
     ]
 
 
+class _HostDecoder:
+    """A batch's decoder caches as host arrays, each step one run of the step
+    graph (ONNX Runtime, or an engine session with host inputs)."""
+
+    def __init__(self, reader: "MathReader", ck, cv, mask, B: int):
+        self.r = reader
+        self.sk, self.sv, self.ck, self.cv = reader._caches(ck, cv, B)
+        self.mask = mask
+
+    def step(self, tok, t: int):
+        logits, self.sk, self.sv = self.r._step(tok, t, self.sk, self.sv, self.ck, self.cv, self.mask)
+        return logits
+
+    def take(self, live) -> None:
+        r = self.r
+        self.mask = self.mask[live]
+        self.sk, self.sv = r._take(self.sk, live), r._take(self.sv, live)
+        self.ck, self.cv = r._take(self.ck, live), r._take(self.cv, live)
+
+
 class MathReader:
     rescore = False  # math_rescore: beam search + draft agreement on unsure lines
     # prose_splice: an accepted whole-line reading keeps the plain reading's prose
@@ -429,6 +449,11 @@ class MathReader:
         # Exports drop unused inputs (the init graph does not read the mask).
         self.inputs = {f: {i.name for i in v.get_inputs()} for f, v in s.items()}
         self.step_in = self.inputs[step]
+        # The encoder, the init graph and the per-layer step graph all on the GPU
+        # engine: the decoder's caches can stay on the device (gpu.DeviceDecoder).
+        from .gpu import TrtSession
+
+        self.on_engine = self.split_kv and all(isinstance(x, TrtSession) for x in (self.enc, self.init, self.step))
         acc = onnx_dir / "math_accept.json"
         self.accept_head = json.loads(acc.read_text(encoding="utf-8")) if acc.exists() else None
         gate = onnx_dir / "math_gate.json"
@@ -546,6 +571,21 @@ class MathReader:
         logits, sk, sv = self.step.run(None, {k: v for k, v in feed.items() if k in self.step_in})
         return logits, sk, sv
 
+    def _decoder(self, arr: np.ndarray, widths: np.ndarray, B: int):
+        """The decoding state of one batch of line crops, after the encoder and
+        the init graph: its caches on the GPU engine (gpu.DeviceDecoder) when
+        the three graphs run there and the batch fits, else in host arrays."""
+        if getattr(self, "on_engine", False):
+            from .gpu import DeviceDecoder
+
+            if DeviceDecoder.fits(self, arr, widths):
+                return DeviceDecoder(self, arr, widths, B)
+        mem, mask = self.enc.run(None, {"x": arr, "widths": widths})
+        feed = {"memory": mem, "mask": mask}
+        names = self.inputs["math_dec_init.onnx"]
+        ck, cv = self.init.run(None, {k: v for k, v in feed.items() if k in names})
+        return _HostDecoder(self, ck, cv, mask, B)
+
     def read(
         self,
         gray: np.ndarray,
@@ -562,12 +602,8 @@ class MathReader:
         widths = [c.shape[1] for c in crops]
         for idx in width_batches(widths, batch, max_ratio=4.0, max_area=16 * 64 * 640):
             arr, widths = pad_batch([crops[j] for j in idx])
-            mem, mask = self.enc.run(None, {"x": arr, "widths": widths})
-            feed = {"memory": mem, "mask": mask}
-            names = self.inputs["math_dec_init.onnx"]
-            ck, cv = self.init.run(None, {k: v for k, v in feed.items() if k in names})
             B = len(idx)
-            sk, sv, ck, cv = self._caches(ck, cv, B)
+            dec = self._decoder(arr, widths, B)
             tok = np.full(B, BOS, np.int64)
             seqs: list[list[int]] = [[] for _ in range(B)]
             probs: list[list[float]] = [[] for _ in range(B)]
@@ -575,7 +611,7 @@ class MathReader:
             in_math = [False] * B  # inside a $...$ span
             text_like = [False] * B  # the reading already fails accept_math
             for t in range(self.max_tokens - 1):
-                logits, sk, sv = self._step(tok, t, sk, sv, ck, cv, mask)
+                logits = dec.step(tok, t)
                 tok = logits.argmax(-1).astype(np.int64)
                 e = np.exp(logits - logits.max(-1, keepdims=True))
                 top = 1.0 / e.sum(-1)  # softmax probability of the argmax token
@@ -599,9 +635,8 @@ class MathReader:
                 if not live.all():
                     # Finished lines leave the batch: a step costs about its
                     # number of lines, and the longest line sets the step count.
-                    rows, tok, mask = rows[live], tok[live], mask[live]
-                    sk, sv = self._take(sk, live), self._take(sv, live)
-                    ck, cv = self._take(ck, live), self._take(cv, live)
+                    rows, tok = rows[live], tok[live]
+                    dec.take(live)
             for k, j in enumerate(idx):
                 if text_like[k]:
                     continue  # stays ("", 0.0): not math

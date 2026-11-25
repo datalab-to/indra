@@ -138,6 +138,13 @@ def _main(argv=None):
     ap.add_argument(
         "--timings", action="store_true", help="print per-page timings to stderr"
     )
+    ap.add_argument(
+        "--device",
+        default="cpu",
+        help="cpu (default), or cuda / cuda:N: the models on the GPU (the indra-ocr-cuda "
+        "engine where installed, else onnxruntime-gpu's CUDA provider); use --cores to "
+        "set how many worker processes share the GPU",
+    )
     a = ap.parse_args(argv)
     if a.out:
         a.out.mkdir(parents=True, exist_ok=True)
@@ -155,6 +162,7 @@ def _main(argv=None):
         math_spans=a.math_spans,
         math_rescore=a.math_rescore,
         words=a.words,
+        **({"device": a.device} if a.device != "cpu" else {}),
         **source_options(a),
     )
     for path, result in results:
