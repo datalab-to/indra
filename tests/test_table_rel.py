@@ -1,6 +1,6 @@
 import numpy as np
 
-from indra_ocr.table_rel import decode, norm_boxes, table_html, word_features, words_of
+from indra_ocr.table_rel import cells_html, decode, norm_boxes, table_html, word_features, words_of
 
 
 def _words():
@@ -184,6 +184,47 @@ def test_a_lone_label_or_number_keeps_its_column():
     boxes = np.array([w["box"] for w in words], np.float32)
     html = table_html(decode(pair, tags, boxes, texts=texts), words)
     assert "colspan" not in html
+
+
+def test_a_wrapped_label_belongs_to_its_own_row():
+    # A label running to two lines right under the header belongs to its own row,
+    # not to the header row above it
+    boxes = np.array(
+        [
+            [0, 0, 60, 10],  # header
+            [120, 0, 180, 10],  # header
+            [0, 16, 90, 36],  # two-line label, just under the header
+            [120, 22, 150, 32],  # its row's value
+            [0, 45, 60, 55],  # next row
+            [120, 45, 150, 55],
+        ],
+        np.float64,
+    )
+    texts = ["项目", "2025年", "归属于上市公司股 东的净利润", "1", "总资产", "2"]
+    html = cells_html([[0], [1], [2], [3], [4], [5]], boxes, texts)
+    assert "<tr><td>归属于上市公司股 东的净利润</td><td>1</td></tr>" in html
+    assert "<tr><td>总资产</td><td>2</td></tr>" in html
+
+
+def test_a_wrapped_label_ending_at_a_column_start_is_two_cells():
+    # A label that ends right at the next column's left edge, its neighbour on the
+    # same line: two cells the model merged
+    boxes = np.array(
+        [
+            [0, 0, 60, 10],
+            [130, 0, 190, 10],
+            [250, 0, 330, 10],
+            [0, 20, 120, 30],  # the long first-column label
+            [130, 20, 200, 30],  # its right neighbour, on 'names's left edge
+            [250, 20, 330, 30],
+            [130, 40, 200, 50],
+            [250, 40, 330, 50],
+        ],
+        np.float64,
+    )
+    texts = ["保荐机构", "名称", "中银国际证券", "履行持续督导职责的保", "办公地址", "北京", "签名", "杨青松"]
+    html = cells_html([[0], [1], [2], [3, 4], [5], [6], [7]], boxes, texts)
+    assert "<td>履行持续督导职责的保</td><td>办公地址</td>" in html
 
 
 def test_leader_dots_end_no_cell():

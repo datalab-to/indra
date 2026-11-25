@@ -93,13 +93,32 @@ def _rows(boxes: np.ndarray) -> list[list[int]]:
     return [sorted(r, key=lambda k: boxes[k, 0]) for r in rows]
 
 
-def _merge_wrapped(rows: list[list[int]], boxes: np.ndarray) -> list[list[int]]:
+def _same_columns(a: list[int], b: list[int], boxes: np.ndarray) -> bool:
+    """Every line of ``a`` lies over a line of ``b``: one wrapped cell's first
+    lines above the rest of that cell."""
+    for i in a:
+        x0, x1 = boxes[i, 0], boxes[i, 2]
+        if not any(
+            min(x1, boxes[j, 2]) - max(x0, boxes[j, 0]) > 0.5 * (x1 - x0) for j in b
+        ):
+            return False
+    return True
+
+
+def _merge_wrapped(
+    rows: list[list[int]],
+    boxes: np.ndarray,
+    skip: set[int] | frozenset[int] = frozenset(),
+) -> list[list[int]]:
     """Join the line rows of wrapped cells into one table row.
 
     Inside a wrapped cell the gap to the next line is the font's line gap; a new
     table row adds cell padding.  A row joins the row above when its gap is under
-    half the table's median row gap and under 0.6 line heights, and it has fewer
-    lines than the row above (a continuation fills only the wrapped columns)."""
+    half the table's median row gap and under 0.6 line heights, and either it has
+    fewer lines than the row above (a continuation fills only the wrapped
+    columns) or the row above has fewer lines, each over a line of this row (a
+    wrapped first column beside a row of data).  ``skip``: rows that hold a cell
+    spanning several rows (a merged header cell) never join their neighbours."""
     if len(rows) < 3:
         return rows
     h = float(np.median(boxes[:, 3] - boxes[:, 1]))
@@ -107,16 +126,47 @@ def _merge_wrapped(rows: list[list[int]], boxes: np.ndarray) -> list[list[int]]:
         float(boxes[nxt, 1].min() - boxes[cur, 3].max())
         for cur, nxt in zip(rows[:-1], rows[1:])
     ]
-    med = float(np.median(gaps))
+    # Only real gaps count: a cell spanning two rows overlaps the rows above and
+    # below it, and those negative gaps would drag the median down.
+    positive = [g for g in gaps if g > 0]
+    med = float(np.median(positive)) if positive else 0.0
     out = [list(rows[0])]
-    prev = rows[0]
-    for g, r in zip(gaps, rows[1:]):
-        # A continuation fills only the wrapped columns: fewer lines than the row above.
-        if g < 0.5 * med and g < 0.6 * h and len(r) < len(prev):
+    for i, g in enumerate(gaps, 1):
+        r, prev = rows[i], rows[i - 1]
+        wrapped = len(r) < len(prev) or (
+            len(prev) < len(r) and _same_columns(prev, r, boxes)
+        )
+        if i not in skip and i - 1 not in skip and g < 0.5 * med and g < 0.6 * h and wrapped:
             out[-1] += r
         else:
             out.append(list(r))
-        prev = r
+    return out
+
+
+def _row_spans(boxes: np.ndarray, rows: list[list[int]]) -> dict[int, tuple[int, int]]:
+    """{cell: (first row, last row)} for cells that cover two or more rows.
+
+    ``_rows`` puts a cell tall enough to centre between two rows (a merged header
+    cell) in a row of its own.  Its box still covers the bands of the rows above
+    and below by more than half, so it is rendered once, with a rowspan, in the
+    first of them."""
+    h = float(np.median(boxes[:, 3] - boxes[:, 1]))
+    bands = [(float(boxes[r, 1].min()), float(boxes[r, 3].max())) for r in rows]
+    out = {}
+    for r, cells in enumerate(rows):
+        for i in cells:
+            y0, y1 = float(boxes[i, 1]), float(boxes[i, 3])
+            if y1 - y0 <= 1.5 * h:
+                continue
+            cover = [
+                k
+                for k in range(len(rows))
+                if k != r
+                and min(y1, bands[k][1]) - max(y0, bands[k][0])
+                > 0.5 * (bands[k][1] - bands[k][0])
+            ]
+            if len(cover) >= 2:
+                out[i] = (cover[0], cover[-1])
     return out
 
 
@@ -124,7 +174,8 @@ def table_html(boxes: np.ndarray, texts: list[str]) -> str:
     """An HTML table from cell lines (one text line per cell, as born-digital PDFs give).
 
     A first row that is one line across most of the table is a title: it goes
-    before the table as text.  The first remaining row is the header (<th>)."""
+    before the table as text.  The first remaining row is the header (<th>).  A
+    cell that covers several rows or columns keeps them: rowspan and colspan."""
     rows = _rows(boxes)
     span_x = boxes[:, 2].max() - boxes[:, 0].min()
     if (
@@ -141,7 +192,41 @@ def table_html(boxes: np.ndarray, texts: list[str]) -> str:
         )
     width = max(len(r) for r in rows)
     full = [r for r in rows if len(r) == width]
-    rows = _merge_wrapped(rows, boxes)
+    h = float(np.median(boxes[:, 3] - boxes[:, 1]))
+    tall = {i for r in rows for i in r if boxes[i, 3] - boxes[i, 1] > 1.5 * h}
+    rows = _merge_wrapped(
+        rows, boxes, {r for r, cells in enumerate(rows) if any(i in tall for i in cells)}
+    )
+    # A cell covering several rows (a merged header cell) is rendered once, in
+    # the first row it covers, with a rowspan.
+    spans = _row_spans(boxes, rows)
+    extra: dict[int, list[int]] = {r: [] for r in range(len(rows))}
+    for r, cells in enumerate(rows):
+        for i in cells:
+            if i in spans and spans[i][0] != r:
+                extra[spans[i][0]].append(i)
+    drop = {
+        r
+        for r, cells in enumerate(rows)
+        if cells and all(i in spans and spans[i][0] != r for i in cells)
+    }
+    old2new: dict[int, int] = {}
+    kept: list[list[int]] = []
+    for r, cells in enumerate(rows):
+        if r in drop:
+            continue
+        old2new[r] = len(kept)
+        kept.append(
+            [i for i in cells if not (i in spans and spans[i][0] != r)] + extra[r]
+        )
+    rowspan: dict[int, int] = {}
+    for i, (a, b) in spans.items():
+        if a not in old2new:
+            continue
+        covered_rows = [old2new[k] for k in range(a, b + 1) if k in old2new]
+        if len(covered_rows) >= 2:
+            rowspan[i] = covered_rows[-1] - old2new[a] + 1
+    rows = kept
     # Column bands from the rows with the most cells: those rows rarely span.
     bands = np.array(
         [
@@ -158,11 +243,10 @@ def table_html(boxes: np.ndarray, texts: list[str]) -> str:
         + [(bands[c, 1] + bands[c + 1, 0]) / 2 for c in range(width - 1)]
         + [np.inf]
     )
-    out = ["<table>"]
-    for ri, r in enumerate(rows):
-        tag = "th" if ri == 0 and len(rows) > 1 else "td"
-        cells: dict[int, tuple[int, str]] = {}
-        for k in sorted(r, key=lambda k: (boxes[k, 1], boxes[k, 0])):
+    placed: dict[int, dict[int, tuple[int, int, str]]] = {}
+    for r, cells in enumerate(rows):
+        slots: dict[int, tuple[int, int, str]] = {}
+        for k in sorted(cells, key=lambda k: (boxes[k, 1], boxes[k, 0])):
             x0, x1 = boxes[k, 0], boxes[k, 2]
             first = int(np.searchsorted(edges, x0, side="right") - 1)
             last = int(np.searchsorted(edges, x1, side="right") - 1)
@@ -174,18 +258,38 @@ def table_html(boxes: np.ndarray, texts: list[str]) -> str:
                 > 0.5 * (bands[c, 1] - bands[c, 0])
             ] or [min(max(first, 0), width - 1)]
             c0 = span[0]
-            prev = cells.get(c0)
-            text = texts[k] if prev is None else prev[1] + " " + texts[k]
-            cells[c0] = (len(span) if prev is None else max(prev[0], len(span)), text)
+            prev = slots.get(c0)
+            rs = rowspan.get(k, 1)
+            if prev is None:
+                slots[c0] = (rs, len(span), texts[k])
+            else:
+                slots[c0] = (
+                    max(prev[0], rs),
+                    max(prev[1], len(span)),
+                    join_lines([prev[2], texts[k]]),
+                )
+        placed[r] = slots
+    n = len(rows)
+    covered = np.zeros((n, width), bool)
+    for r in range(n):
+        for c0, (rs, cs, _) in placed[r].items():
+            covered[r : r + rs, c0 : c0 + cs] = True
+    out = ["<table>"]
+    for r in range(n):
+        tag = "th" if r == 0 and n > 1 else "td"
         tds, c = [], 0
         while c < width:
-            if c in cells:
-                n, text = cells[c]
-                attr = f' colspan="{n}"' if n > 1 else ""
+            item = placed[r].get(c)
+            if item is not None:
+                rs, cs, text = item
+                attr = (f' rowspan="{rs}"' if rs > 1 else "") + (
+                    f' colspan="{cs}"' if cs > 1 else ""
+                )
                 tds.append(f"<{tag}{attr}>{html.escape(text, quote=False)}</{tag}>")
-                c += n
+                c += cs
             else:
-                tds.append(f"<{tag}></{tag}>")
+                if not covered[r, c]:  # covered by a rowspan above: no cell here
+                    tds.append(f"<{tag}></{tag}>")
                 c += 1
         out.append("<tr>" + "".join(tds) + "</tr>")
     out.append("</table>")
@@ -209,7 +313,8 @@ def heads_plausible(boxes: np.ndarray, tab: np.ndarray) -> bool:
 
 def table_html_heads(boxes: np.ndarray, texts: list[str], tab: np.ndarray) -> str:
     """An HTML table from the OrderNet table heads.  tab [3, N, N] = logits
-    same row, same column, same cell, for the N lines of one table block."""
+    same row, same column, same cell, for the N lines of one table block.  A cell
+    that covers several rows or columns keeps them: rowspan and colspan."""
     cells = _cluster(tab[2])
     cb = np.array(
         [
@@ -218,7 +323,7 @@ def table_html_heads(boxes: np.ndarray, texts: list[str], tab: np.ndarray) -> st
         ]
     )
     ctext = [
-        " ".join(texts[k] for k in sorted(c, key=lambda k: (boxes[k, 1], boxes[k, 0])))
+        join_lines([texts[k] for k in sorted(c, key=lambda k: (boxes[k, 1], boxes[k, 0]))])
         for c in cells
     ]
     m = len(cells)
@@ -236,7 +341,43 @@ def table_html_heads(boxes: np.ndarray, texts: list[str], tab: np.ndarray) -> st
     col_of = {c: k for k, g in enumerate(cols) for c in g}
     centers = [float(np.median((cb[g, 0] + cb[g, 2]) / 2)) for g in cols]
     h = float(np.median(boxes[:, 3] - boxes[:, 1]))
-    grid: dict[tuple[int, int], tuple[int, str]] = {}
+
+    def band_span(lo: float, hi: float, bands: list) -> list[int]:
+        return [
+            k
+            for k, (a, b) in enumerate(bands)
+            if min(hi, b) - max(lo, a) > 0.5 * (b - a)
+        ]
+
+    # A cell taller than one line and covering two or more row bands (a merged
+    # header cell) starts at the first row it covers, with a rowspan.
+    rbands = [(float(cb[g, 1].min()), float(cb[g, 3].max())) for g in rows]
+    spans: dict[int, tuple[int, int]] = {}
+    for c in range(m):
+        if cb[c, 3] - cb[c, 1] > 1.5 * h:
+            cover = band_span(cb[c, 1], cb[c, 3], rbands)
+            if len(cover) >= 2:
+                spans[c] = (cover[0], cover[-1])
+    first_row = {c: spans.get(c, (row_of[c], row_of[c]))[0] for c in range(m)}
+    drop = {
+        r
+        for r, g in enumerate(rows)
+        if g and all(first_row[c] != r for c in g)
+    }
+    old2new: dict[int, int] = {}
+    kept = []
+    for r in range(len(rows)):
+        if r in drop:
+            continue
+        old2new[r] = len(kept)
+        kept.append(r)
+    rowspan: dict[int, int] = {}
+    for c, (a, b) in spans.items():
+        covered_rows = [old2new[k] for k in range(a, b + 1) if k in old2new]
+        if len(covered_rows) >= 2:
+            rowspan[c] = covered_rows[-1] - old2new[a] + 1
+    n = len(kept)
+    grid: dict[tuple[int, int], tuple[int, int, str]] = {}
     for c in range(m):
         c0 = col_of[c]
         span = 1
@@ -244,23 +385,30 @@ def table_html_heads(boxes: np.ndarray, texts: list[str], tab: np.ndarray) -> st
             c0 + span < len(cols) and cb[c, 0] - h <= centers[c0 + span] <= cb[c, 2] + h
         ):
             span += 1
-        key = (row_of[c], c0)
+        key = (old2new[first_row[c]], c0)
+        rs = rowspan.get(c, 1)
         if key in grid:  # two cells on one slot: keep both texts
-            grid[key] = (max(grid[key][0], span), grid[key][1] + " " + ctext[c])
+            grid[key] = (max(grid[key][0], rs), max(grid[key][1], span), join_lines([grid[key][2], ctext[c]]))
         else:
-            grid[key] = (span, ctext[c])
+            grid[key] = (rs, span, ctext[c])
+    covered = np.zeros((n, len(cols)), bool)
+    for (r, c0), (rs, cs, _) in grid.items():
+        covered[r : r + rs, c0 : c0 + cs] = True
     out = ["<table>"]
-    for r in range(len(rows)):
-        tag = "th" if r == 0 and len(rows) > 1 else "td"
+    for r in range(n):
+        tag = "th" if r == 0 and n > 1 else "td"
         tds, c = [], 0
         while c < len(cols):
             if (r, c) in grid:
-                span, text = grid[(r, c)]
-                attr = f' colspan="{span}"' if span > 1 else ""
+                rs, span, text = grid[(r, c)]
+                attr = (f' rowspan="{rs}"' if rs > 1 else "") + (
+                    f' colspan="{span}"' if span > 1 else ""
+                )
                 tds.append(f"<{tag}{attr}>{html.escape(text, quote=False)}</{tag}>")
                 c += span
             else:
-                tds.append(f"<{tag}></{tag}>")
+                if not covered[r, c]:
+                    tds.append(f"<{tag}></{tag}>")
                 c += 1
         out.append("<tr>" + "".join(tds) + "</tr>")
     out.append("</table>")
