@@ -32,6 +32,7 @@ test = ["pytest", "pillow", "pikepdf"]
 [project.scripts]
 indra-ocr = "indra_ocr.cli:main"
 indra-ocr-viewer = "indra_ocr.viewer:main"
+indra-ocr-serve = "indra_ocr.server:main"
 
 [tool.setuptools]
 packages = ["indra_ocr"]
