@@ -654,7 +654,9 @@ class Converter:
                 b[0] = min(b[0], float(near[:, 0].min()) - pad)
                 b[2] = max(b[2], float(near[:, 2].max()) + pad)
         rbox[:, [0, 2]] = np.clip(rbox[:, [0, 2]], 0, gray.shape[1] - 1)
-        reads = self.ocr.recognize(gray, rbox[idx])
+        # The recognizers' readings: MathRec's LaTeX does not compare with the
+        # layer's characters, and the math lines are read after this (_read_math).
+        reads = self.ocr.recognize(gray, rbox[idx], math=False)
         cand_boxes, cand_toks, owners = [], [], []
         for i, (text, _, _) in zip(idx, reads):
             layer = "".join(t[0] if isinstance(t[0], str) else " " for t in toks[i])

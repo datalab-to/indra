@@ -734,11 +734,14 @@ class OrtOCR:
         boxes: np.ndarray,
         batch: int = 64,
         vertical: bool = False,
+        math: bool = True,
     ) -> list[tuple[str, float, list]]:
         """(text, confidence, tokens) per line; tokens = [(token id, page x)],
         x from the CTC peak's timestep mapped back through the crop.  A line
         under MIN_CONF comes back empty.  vertical: the page is a vertical one
-        turned a quarter turn (every line to the CJK recognizer)."""
+        turned a quarter turn (every line to the CJK recognizer).  math=False:
+        the recognizers' readings only, MathRec not asked (for callers that
+        compare the readings with a text layer)."""
         # CenterMask first when the model folder has mask.onnx
         pool = getattr(self, "pool", None)
         window = getattr(self, "window", 1)
@@ -913,7 +916,7 @@ class OrtOCR:
                 if moved:
                     hw_crops, hw_tall = hw_crops_for(moved)
                     read([(rec_hw, self.vocab, moved, False)], force=True)
-        if getattr(self, "math", None) is not None and crops:
+        if math and getattr(self, "math", None) is not None and crops:
             # MathRec reads a line whose reading is mostly Latin (a formula line may
             # have gone to a group recognizer: Greek letters to rec_world), or a line
             # whose letters its own vocabulary writes (a MathRec whose vocabulary has
@@ -1409,7 +1412,8 @@ class OrtOCR:
         lines turned half round); the reading the recognizers are surest of picks the
         side.  On the counter-clockwise side, a quarter turn (3) and vertical columns
         (VERTICAL) give the same crops, so orient.onnx, which sees the characters'
-        shape, picks between them."""
+        shape, picks between them.  The lines are read by the recognizers alone
+        (recognize(math=False)): only their confidences are kept."""
 
         def longest(img):
             bx = self.detect(img)
@@ -1418,7 +1422,7 @@ class OrtOCR:
         def conf(img, bx):
             if not len(bx):
                 return 0.0
-            return float(np.mean([c for _, c, _ in self.recognize(img, bx)]))
+            return float(np.mean([c for _, c, _ in self.recognize(img, bx, math=False)]))
 
         up, _, _ = self._turn(gray, 0, a, small)
         ccw, _, _ = self._turn(gray, 3, a, small)
@@ -1440,7 +1444,7 @@ class OrtOCR:
         def conf(img):
             bx = self.detect(img)
             bx = bx[np.argsort(-(bx[:, 2] - bx[:, 0]))[:SIDEWAYS_LINES]]
-            return float(np.mean([c for _, c, _ in self.recognize(img, bx)])) if len(bx) else 0.0
+            return float(np.mean([c for _, c, _ in self.recognize(img, bx, math=False)])) if len(bx) else 0.0
 
         up, _, _ = self._turn(gray, 0, a, small)
         down, _, _ = self._turn(gray, 2, a, small)

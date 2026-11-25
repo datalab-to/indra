@@ -40,3 +40,24 @@ def test_only_ascii_digits_are_checked():
     toks = [("❶", 10.0, 0), (" ", 10.0, 0), ("२", 30.0, 0), ("८", 40.0, 0)]
     sym = np.array([[0.0, 0.0, 50.0, 10.0]], np.float32)
     assert symbol_words(toks, [0.0, 0.0, 60.0, 10.0], sym) == []
+
+
+def test_the_fix_reads_its_lines_without_mathrec():
+    """The candidate lines are read by the recognizers alone: MathRec's LaTeX
+    reading would hide the symbol (math lines are read after the fix)."""
+    from indra_ocr.document import Converter
+
+    seen = []
+
+    class OCR:
+        def recognize(self, gray, boxes, batch=64, vertical=False, math=True):
+            seen.append(math)
+            return [("1", 0.9, [])] * len(boxes)
+
+    conv = Converter.__new__(Converter)
+    conv.ocr = OCR()
+    toks = [[("1", 10.0, 0)]]
+    boxes = np.array([[0, 0, 100, 20]], np.float32)
+    sym = np.array([[5, 0, 15, 20]], np.float32)
+    assert conv._fix_symbol_digits(np.zeros((40, 200), np.uint8), boxes, toks, sym) == 0
+    assert seen == [False]
