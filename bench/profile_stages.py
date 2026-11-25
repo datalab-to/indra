@@ -93,6 +93,10 @@ def main():
     )
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--pages", type=int, default=300)
+    ap.add_argument(
+        "--offset", type=int, default=0,
+        help="start at this page (several processes with offsets 0..k-1 and --pages N/k share the pages)",
+    )
     ap.add_argument("--mode", choices=["auto", "ocr", "text"], default="auto")
     ap.add_argument("--dataset", default=data.DEFAULT_DATASET)
     ap.add_argument("--models", default=None, help="model folder (default: download)")
@@ -169,7 +173,7 @@ def main():
     )
     pages = pages_of(a.dataset)
     step = max(1, len(pages) // a.pages)
-    chosen = pages[::step][: a.pages]
+    chosen = pages[a.offset :: step][: a.pages]
     read(conv, chosen[0][2])  # warm-up
     rows = []
     dump = open(a.out / "outputs.jsonl", "w", encoding="utf-8") if a.dump else None

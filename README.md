@@ -363,8 +363,8 @@ Each page runs in a single-threaded worker process, page headers and footers kep
 More tools in `bench/`, each with its usage in its docstring:
 
 - `compare_outputs.py RUN_A RUN_B`: two `--dump` runs page by page (identical pages, what differs, `--chars` for the characters changed) and their scores and times.
-- `ab_variant.py --variant ...`: two behaviours of the pipeline read page by page in the same worker, the order alternating, for paired times and outputs (`native`: the native kernels off and on).
-- `profile_stages.py`: one process, one page at a time; every ONNX model and every pipeline step timed, by page source, on the CPU or the GPU.
+- `ab_variant.py --variant ...`: two behaviours of the pipeline read page by page in the same worker, the order alternating, for paired times and outputs (`native`: the native kernels off and on; `pieces`: line models run whole batches or in pieces).
+- `profile_stages.py`: one process, one page at a time; every ONNX model and every pipeline step timed, by page source, on the CPU or the GPU (`--offset`: several processes, each on its own share of the pages, time the models with every core busy).
 - `throughput.py --cores 8 16 32`: pages per second with one single-threaded worker process per core.
 
 # Credits

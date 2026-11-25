@@ -52,9 +52,31 @@ def _variant_recognizer_math():
     return lambda mode: nullcontext()
 
 
+def _variant_pieces():
+    """a: every line model runs each batch whole, as in 1.2.0; b: in pieces of
+    rows (ort_session.RowPieces), the code as it is."""
+    from contextlib import nullcontext
+
+    from indra_ocr import ort_session
+
+    if not hasattr(ort_session, "RowPieces"):
+        raise SystemExit("pieces needs ort_session.RowPieces")
+    rows0 = ort_session.RowPieces.rows
+
+    def rows(self, x):
+        return len(x) if _MODE[0] == "a" else rows0(self, x)
+
+    ort_session.RowPieces.rows = rows
+    return lambda mode: nullcontext()
+
+
 # A variant patches the pipeline once in each worker and returns, for a mode
 # ("a" or "b"), the context the page is read in.
-VARIANTS = {"native": _variant_native, "recognizer-math": _variant_recognizer_math}
+VARIANTS = {
+    "native": _variant_native,
+    "recognizer-math": _variant_recognizer_math,
+    "pieces": _variant_pieces,
+}
 _CTX = None
 
 
@@ -146,12 +168,13 @@ def main():
     ap.add_argument("--procs", type=int, default=8)
     ap.add_argument("--pin", default="", help="CPUs, e.g. 16-31 or 0,2,4: worker k on the k-th")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--every", type=int, default=1, help="every k-th page (spread over the benchmark)")
     ap.add_argument("--pdf-only", action="store_true", help="only the PDF pages")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     _, pages = data.read_manifest(a.dataset)
     items = [(p.page_id, str(p.doc_path)) for p in pages if not a.pdf_only or p.doc_path.suffix == ".pdf"]
-    items = [(k, *it) for k, it in enumerate(items[: a.limit or None])]
+    items = [(k, *it) for k, it in enumerate(items[:: max(1, a.every)][: a.limit or None])]
     args = {"variant": a.variant, "models": a.models, "mode": a.mode, "no_math": a.no_math, "pin": cpus(a.pin)}
     ctx = mp.get_context("spawn")
     rows = []
