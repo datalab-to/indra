@@ -180,6 +180,15 @@ Without the `if __name__ == "__main__":` guard (needed on macOS and Windows), `c
 
 `indra_ocr.load` takes `path` (model folder), `threads`, `dpi`, `mode`, `image_ocr`, `furniture` and `math`. `conv.convert` takes `max_pages` and `password`.
 
+## Server
+
+```shell
+indra-ocr-serve --port 8001 --workers 8          # one worker per usable core by default
+curl -s --data-binary @paper.pdf -H "Content-Type: application/pdf"      "http://127.0.0.1:8001/convert?mode=auto&max_pages=5"
+```
+
+`indra-ocr-serve` keeps the models loaded in a pool of single-threaded worker processes and reads the pages of each file in parallel. `POST /convert` takes a PDF or an image as the body (query parameters `mode`, `math`, `furniture`, `words`, `dpi`, `max_pages`, `password`) and answers every page's markdown, text, blocks, lines, source, rotation, skew and timings as JSON. `GET /health`, `/served` and `/metrics` (pages, failures, page latency) are there for monitoring, and `POST /parse` answers the Omni Parse Bench Indra OCR adapter, so the benchmark's own client can run against the server. `--device cuda --gpus 0,1` puts the workers on GPUs, `--pin` pins them to CPUs, and `--key` (or `INDRA_SERVE_KEY`) requires a bearer token. It listens on 127.0.0.1 unless `--host` says otherwise.
+
 ## Viewer
 
 ```shell
