@@ -507,46 +507,277 @@ def decode(
 LEADER_DOTS = re.compile(r"(\s+[.·…]+)+$")  # space-separated dot runs that end a cell
 
 
+def _cell_text(g: list[int], boxes: np.ndarray, texts: list[str]) -> str:
+    t = " ".join(texts[i] for i in sorted(g, key=lambda i: (boxes[i, 1], boxes[i, 0])))
+    return LEADER_DOTS.sub("", t) or t
+
+
+def cells_html(
+    groups: list[list[int]], boxes: np.ndarray, texts: list[str], n_head: int = 1
+) -> str:
+    """An HTML table rebuilt from the cells the model gives as word groups.
+
+    tsr_rel tells which words share a cell; on a PDF text layer its rows and
+    columns are less reliable (a merged header label is centred between two
+    rows and gets a row of its own, a wrapped label is split).  So the rows and
+    columns come from the geometry here: the body rows give the column bands,
+    the single-line cells give the rows, and a row squeezed between two rows
+    whose columns are empty above and below is the centred label of a header
+    cell that spans those two rows.  A cell keeps a rowspan or colspan when its
+    box covers several rows or columns."""
+    if not groups:
+        return "<table>\n</table>"
+    boxes = np.asarray(boxes, np.float64)
+    h = float(np.median(boxes[:, 3] - boxes[:, 1]))
+    # Split a cell whose words are far apart in x: two cells the model merged.
+    split = []
+    for g in groups:
+        g = sorted(g, key=lambda i: (boxes[i, 0], boxes[i, 1]))
+        cur = [g[0]]
+        for i in g[1:]:
+            if boxes[i, 0] - boxes[cur[-1], 2] > 2.0 * h:
+                split.append(cur)
+                cur = [i]
+            else:
+                cur.append(i)
+        split.append(cur)
+
+    def boxes_of(groups):
+        return np.array(
+            [
+                [boxes[g, 0].min(), boxes[g, 1].min(), boxes[g, 2].max(), boxes[g, 3].max()]
+                for g in groups
+            ]
+        )
+
+    b = boxes_of(split)
+    # A word on the same line that starts on another cell's left edge is another
+    # cell: a wrapped label ends right at a column start, and the model merged it
+    # with its right neighbour.
+    tol = 0.15 * h
+    starts = b[:, 0].tolist()
+    merged = []
+    for k, g in enumerate(split):
+        g = sorted(g, key=lambda i: (boxes[i, 0], boxes[i, 1]))
+        cur = [g[0]]
+        for i in g[1:]:
+            other = [v for j, v in enumerate(starts) if j != k]
+            same_line = abs((boxes[i, 1] + boxes[i, 3]) - (boxes[cur[-1], 1] + boxes[cur[-1], 3])) < h
+            if same_line and other and min(abs(boxes[i, 0] - v) for v in other) <= tol:
+                merged.append(cur)
+                cur = [i]
+            else:
+                cur.append(i)
+        merged.append(cur)
+    split = merged
+    b = boxes_of(split)
+    n = len(split)
+    hh = b[:, 3] - b[:, 1]
+    tall = hh > 1.5 * h
+    cy = (b[:, 1] + b[:, 3]) / 2
+    # Rows from the single-line cells; a merged label centres between rows.
+    rows: list[list[int]] = []
+    for i in np.argsort(cy):
+        if tall[i]:
+            continue
+        if rows and abs(cy[i] - np.mean(cy[rows[-1]])) < 0.5 * h:
+            rows[-1].append(int(i))
+        else:
+            rows.append([int(i)])
+    row_of = {i: r for r, g in enumerate(rows) for i in g}
+    rbands = [(b[g, 1].min(), b[g, 3].max()) for g in rows]
+    for i in np.nonzero(tall)[0]:
+        # A cell taller than a line whose box sits within a single row's band is a
+        # wrapped label of that row, however far its lines run: it belongs to the
+        # row it is centred on, not to the row above it.  One that covers two rows
+        # (a header cell split over two lines) is joined to the cell above it.
+        cov = [k for k, (a, z) in enumerate(rbands) if min(b[i, 3], z) - max(b[i, 1], a) > 0]
+        if len(cov) == 1:
+            row_of[int(i)] = cov[0]
+            continue
+        best, bestd = None, 0.0
+        for j, r in row_of.items():
+            if tall[j] or cy[j] >= cy[i]:
+                continue
+            ov = min(b[i, 2], b[j, 2]) - max(b[i, 0], b[j, 0])
+            gap = max(b[i, 1], b[j, 1]) - min(b[i, 3], b[j, 3])
+            if ov > 0.5 * min(b[i, 2] - b[i, 0], b[j, 2] - b[j, 0]) and gap < 0.75 * h:
+                if best is None or cy[i] - cy[j] < bestd:
+                    best, bestd = r, cy[i] - cy[j]
+        if best is None:
+            ov = [(min(b[i, 3], z) - max(b[i, 1], a)) / max(z - a, 1.0) for a, z in rbands]
+            best = int(np.argmax(ov))
+        row_of[int(i)] = best
+    # Column bands from the row with the most cells (the body rows).
+    body = max(
+        range(len(rows)),
+        key=lambda r: (len(rows[r]), -np.median(b[rows[r], 2] - b[rows[r], 0])),
+    )
+    band = sorted(rows[body], key=lambda i: b[i, 0])
+    C = len(band)
+
+    def cols_of(i: int) -> tuple[int, int]:
+        cover = [
+            k
+            for k in range(C)
+            if min(b[i, 2], b[band[k], 2]) - max(b[i, 0], b[band[k], 0]) > 0
+        ]
+        if cover:
+            return cover[0], cover[-1]
+        # No band under the cell: a header centred over the gap between two
+        # columns (a group header) spans them both.
+        left = [k for k in range(C) if b[band[k], 2] <= b[i, 0]]
+        right = [k for k in range(C) if b[band[k], 0] >= b[i, 2]]
+        if left and right:
+            return left[-1], right[0]
+        k = int(
+            np.argmin(
+                [
+                    abs((b[i, 0] + b[i, 2]) / 2 - (b[band[k], 0] + b[band[k], 2]) / 2)
+                    for k in range(C)
+                ]
+            )
+        )
+        return k, k
+
+    cell_cols = [cols_of(i) for i in range(n)]
+    # A body row with one cell away from the first column (a unit row such as
+    # "(In millions)") spans the table's width.
+    for r, g in enumerate(rows):
+        if (
+            r >= n_head
+            and len(g) == 1
+            and cell_cols[g[0]][0] > 0
+            and any(ch.isalpha() for i in g for ch in texts[i])
+        ):
+            cell_cols[g[0]] = (0, C - 1)
+    # A row squeezed between two rows, its columns empty above and below: the
+    # centred labels of header cells that span those two rows.
+    phantom = set()
+    for r in range(1, len(rows) - 1):
+        members = [i for i in range(n) if row_of[i] == r]
+        if not members:
+            continue
+        up = {
+            c
+            for i in range(n)
+            if row_of[i] == r - 1
+            for c in range(cell_cols[i][0], cell_cols[i][1] + 1)
+        }
+        dn = {
+            c
+            for i in range(n)
+            if row_of[i] == r + 1
+            for c in range(cell_cols[i][0], cell_cols[i][1] + 1)
+        }
+        if (
+            rbands[r][0] - rbands[r - 1][1] < 0.5 * h
+            and rbands[r + 1][0] - rbands[r][1] < 0.5 * h
+            and all(
+                c not in up and c not in dn
+                for i in members
+                for c in range(cell_cols[i][0], cell_cols[i][1] + 1)
+            )
+        ):
+            phantom.add(r)
+    # A row holding one lone label under the same column's line: the tail of a
+    # wrapped cell (its first line is in the row above).
+    snap = dict(row_of)
+    lonely = set()
+    for r in range(1, len(rows)):
+        members = [i for i in range(n) if snap[i] == r and not tall[i]]
+        if len(members) != 1 or cell_cols[members[0]][0] != 0 or r in phantom:
+            continue
+        i = members[0]
+        if rbands[r][0] - rbands[r - 1][1] >= 0.75 * h:
+            continue
+        if any(
+            snap[j] == r - 1
+            and min(b[i, 2], b[j, 2]) - max(b[i, 0], b[j, 0])
+            > 0.5 * min(b[i, 2] - b[i, 0], b[j, 2] - b[j, 0])
+            for j in range(n)
+        ):
+            lonely.add(r)
+    for r in sorted(lonely):
+        for i in range(n):
+            if snap[i] == r:
+                row_of[i] = r - 1
+    keep = [r for r in range(len(rows)) if r not in phantom and r not in lonely]
+    new = {r: k for k, r in enumerate(keep)}
+    grid: dict[tuple[int, int], tuple[int, int, str]] = {}
+    order = sorted(
+        range(n), key=lambda i: (new.get(row_of[i], 0), cell_cols[i][0], b[i, 1])
+    )
+    for i in order:
+        r = row_of[i]
+        cov = [
+            k
+            for k in range(len(rbands))
+            if min(b[i, 3], rbands[k][1]) - max(b[i, 1], rbands[k][0]) > 0
+        ]
+        if r in phantom:
+            r0, r1 = r - 1, r + 1
+        elif tall[i] and cov:
+            r0, r1 = r, max(r, cov[-1])
+        else:
+            r0 = r1 = r
+        c0, c1 = cell_cols[i]
+        covered_rows = [new[x] for x in range(r0, r1 + 1) if x in new]
+        rs = covered_rows[-1] - covered_rows[0] + 1 if covered_rows else 1
+        key = (new.get(r0, 0), c0)
+        text = _cell_text(split[i], boxes, texts)
+        if key in grid:
+            prev = grid[key]
+            grid[key] = (max(prev[0], rs), max(prev[1], c1 - c0 + 1), prev[2] + " " + text)
+        else:
+            grid[key] = (rs, c1 - c0 + 1, text)
+    # A colspan must not swallow a cell of the same row: the writer skips the
+    # columns a cell spans, so a cell it covers would never be written.
+    for (r, c0), (rs, cs, text) in list(grid.items()):
+        for c in range(c0 + 1, c0 + cs):
+            if (r, c) in grid:
+                grid[(r, c0)] = (rs, c - c0, text)
+                break
+    nrows = len(keep)
+    covered = np.zeros((nrows, C), bool)
+    for (r, c0), (rs, cs, _) in grid.items():
+        covered[r : r + rs, c0 : c0 + cs] = True
+    out = ["<table>"]
+    for r in range(nrows):
+        tag = "th" if r < n_head else "td"
+        tds, c = [], 0
+        while c < C:
+            item = grid.get((r, c))
+            if item is not None:
+                rs, cs, text = item
+                attr = (f' rowspan="{rs}"' if rs > 1 else "") + (
+                    f' colspan="{cs}"' if cs > 1 else ""
+                )
+                tds.append(f"<{tag}{attr}>{html.escape(text, quote=False)}</{tag}>")
+                c += cs
+            else:
+                if not covered[r, c]:
+                    tds.append(f"<{tag}></{tag}>")
+                c += 1
+        out.append("<tr>" + "".join(tds) + "</tr>")
+    out.append("</table>")
+    return "\n".join(out)
+
+
 def table_html(struct: dict, words: list[dict]) -> str | None:
-    """HTML for a decoded table; words outside it come before it as text."""
+    """HTML for a decoded table; words outside it come before it as text.
+
+    The model's cells (which words share a cell) are laid out by their
+    geometry (``cells_html``), so merged header cells keep their rowspan and
+    colspan on a PDF text layer."""
     R, C = struct["n_rows"], struct["n_cols"]
     if R < 2 and C < 2:
         return None
-    occ = np.full((R, C), -1)
-    anchors = {}
-    for k, (r0, r1, c0, c1, ws) in enumerate(struct["cells"]):
-        if (occ[r0 : r1 + 1, c0 : c1 + 1] >= 0).any():
-            # Overlapping spans: keep the cell to its own slot only.
-            r1, c1 = r0, c0
-            if occ[r0, c0] >= 0:
-                k0 = occ[r0, c0]
-                anchors[k0][2].extend(ws)
-                continue
-        occ[r0 : r1 + 1, c0 : c1 + 1] = k
-        anchors[k] = [(r0, c0), (r1 - r0 + 1, c1 - c0 + 1), list(ws)]
-
-    def text(ws):
-        ws = sorted(ws, key=lambda i: (words[i]["line"], words[i]["box"][0]))
-        t = " ".join(words[i]["text"] for i in ws)
-        # leader dots between a label and its number are layout, not text
-        return LEADER_DOTS.sub("", t) or t
-
-    by_slot = {a[0]: (k, a) for k, a in anchors.items()}
-    out = ["<table>"]
-    for r in range(R):
-        tag = "th" if r < struct["n_head"] else "td"
-        tds = []
-        for c in range(C):
-            if (r, c) in by_slot:
-                _, (_, (rs, cs), ws) = by_slot[(r, c)]
-                attr = (f' rowspan="{rs}"' if rs > 1 else "") + (f' colspan="{cs}"' if cs > 1 else "")
-                tds.append(f"<{tag}{attr}>{html.escape(text(ws), quote=False)}</{tag}>")
-            elif occ[r, c] < 0:
-                tds.append(f"<{tag}></{tag}>")
-        out.append("<tr>" + "".join(tds) + "</tr>")
-    out.append("</table>")
-    pre = text(struct["outside"]) if struct["outside"] else ""
-    return (pre + "\n\n" if pre else "") + "\n".join(out)
+    boxes = np.array([w["box"] for w in words], np.float32)
+    texts = [w["text"] for w in words]
+    body = cells_html([list(c[4]) for c in struct["cells"]], boxes, texts, struct["n_head"])
+    pre = _cell_text(struct["outside"], boxes, texts) if struct["outside"] else ""
+    return (pre + "\n\n" if pre else "") + body
 
 
 # Word text features of the tsr_refine.onnx refiner.  The model expects exactly
