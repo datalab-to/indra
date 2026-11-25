@@ -534,14 +534,14 @@ class OrtOCR:
         # tsr_split.onnx (optional): row / column separator maps of a table crop, read
         # as extra word features by a tsr_rel.onnx that takes them (table_rel.py).
         self.tsr_split = (
-            ort.InferenceSession(str(onnx_dir / "tsr_split.onnx"), so, providers=prov)
+            session(str(onnx_dir / "tsr_split.onnx"), so, providers=prov)
             if self.tsr_rel is not None and (onnx_dir / "tsr_split.onnx").exists()
             else None
         )
         # tsr_refine.onnx (optional): refines the tsr_rel word tags (table_rel.py).
         # Without the file, tables are as before.
         self.tsr_refine = (
-            ort.InferenceSession(str(onnx_dir / "tsr_refine.onnx"), so, providers=prov)
+            session(str(onnx_dir / "tsr_refine.onnx"), so, providers=prov)
             if self.tsr_rel is not None and (onnx_dir / "tsr_refine.onnx").exists()
             else None
         )
