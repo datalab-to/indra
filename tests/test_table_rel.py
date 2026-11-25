@@ -200,10 +200,10 @@ def test_a_wrapped_label_belongs_to_its_own_row():
         ],
         np.float64,
     )
-    texts = ["项目", "2025年", "归属于上市公司股 东的净利润", "1", "总资产", "2"]
+    texts = ["Item", "2025", "net profit of the parent company", "1", "Total assets", "2"]
     html = cells_html([[0], [1], [2], [3], [4], [5]], boxes, texts)
-    assert "<tr><td>归属于上市公司股 东的净利润</td><td>1</td></tr>" in html
-    assert "<tr><td>总资产</td><td>2</td></tr>" in html
+    assert "<tr><td>net profit of the parent company</td><td>1</td></tr>" in html
+    assert "<tr><td>Total assets</td><td>2</td></tr>" in html
 
 
 def test_a_wrapped_label_ending_at_a_column_start_is_two_cells():
@@ -222,9 +222,9 @@ def test_a_wrapped_label_ending_at_a_column_start_is_two_cells():
         ],
         np.float64,
     )
-    texts = ["保荐机构", "名称", "中银国际证券", "履行持续督导职责的保", "办公地址", "北京", "签名", "杨青松"]
+    texts = ["Sponsor", "Name", "ABC Securities", "term of the sponsor's", "Address", "Beijing", "Signature", "Yang"]
     html = cells_html([[0], [1], [2], [3, 4], [5], [6], [7]], boxes, texts)
-    assert "<td>履行持续督导职责的保</td><td>办公地址</td>" in html
+    assert "<td>term of the sponsor's</td><td>Address</td>" in html
 
 
 def test_leader_dots_end_no_cell():

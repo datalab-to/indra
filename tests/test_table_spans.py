@@ -15,15 +15,15 @@ def _header():
         boxes.append([x0, y0, x1, y1])
         texts.append(t)
 
-    add(*X[0], 0, 40, "主要会计数据")
-    add(*X[1], 0, 40, "2025年")
-    add(300, 620, 0, 20, "2024年")
-    add(*X[4], 0, 40, "本期比上年同期增减(%)")
-    add(*X[5], 0, 40, "2023年")
-    add(*X[2], 20, 40, "调整后")
-    add(*X[3], 20, 40, "调整前")
-    add(*X[0], 50, 70, "归属于上市公司股")
-    add(*X[0], 71, 91, "东的净利润")
+    add(*X[0], 0, 40, "Main figures")
+    add(*X[1], 0, 40, "2025")
+    add(300, 620, 0, 20, "2024")
+    add(*X[4], 0, 40, "Change year on year (%)")
+    add(*X[5], 0, 40, "2023")
+    add(*X[2], 20, 40, "Restated")
+    add(*X[3], 20, 40, "As reported")
+    add(*X[0], 50, 70, "net profit attribut-")
+    add(*X[0], 71, 91, "able to shareholders")
     for c, (x0, x1) in enumerate(X[1:], 1):
         add(x0, x1, 71, 91, f"v{c}")
     return np.array(boxes, np.float32), texts
@@ -32,12 +32,12 @@ def _header():
 def test_merged_header_cells_keep_their_spans():
     boxes, texts = _header()
     html = table_html(boxes, texts)
-    assert '<th rowspan="2">主要会计数据</th>' in html
-    assert '<th rowspan="2">2025年</th>' in html
-    assert '<th colspan="2">2024年</th>' in html
-    assert '<th rowspan="2">2023年</th>' in html
+    assert '<th rowspan="2">Main figures</th>' in html
+    assert '<th rowspan="2">2025</th>' in html
+    assert '<th colspan="2">2024</th>' in html
+    assert '<th rowspan="2">2023</th>' in html
     assert html.count("<tr>") == 3  # two header rows, one body row
-    assert "<td>归属于上市公司股东的净利润</td>" in html
+    assert "<td>net profit attributable to shareholders</td>" in html
 
 
 def test_heads_merged_header_cells_keep_their_spans():
@@ -61,7 +61,7 @@ def test_heads_merged_header_cells_keep_their_spans():
     tags[:7, 0] = 5.0  # header words
 
     html = table_html_heads(boxes, texts, tab)
-    assert '<th rowspan="2">主要会计数据</th>' in html
-    assert '<th colspan="2">2024年</th>' in html
-    assert "<td>归属于上市公司股东的净利润</td>" in html
+    assert '<th rowspan="2">Main figures</th>' in html
+    assert '<th colspan="2">2024</th>' in html
+    assert "<td>net profit attributable to shareholders</td>" in html
     assert html.count("<tr>") == 3
