@@ -227,6 +227,24 @@ def test_a_wrapped_label_ending_at_a_column_start_is_two_cells():
     assert "<td>term of the sponsor's</td><td>Address</td>" in html
 
 
+def test_a_wide_label_does_not_swallow_its_neighbour():
+    # A long label's box reaches into the next column's band (a header there can
+    # be wider than the band its text needs): the label must not take a colspan
+    # over its neighbour, or the writer skips that column and drops the value
+    boxes = np.array(
+        [
+            [0, 0, 100, 10],  # header, column 0
+            [180, 0, 280, 10],  # header, column 1
+            [0, 20, 200, 30],  # long label, over column 1's band
+            [210, 20, 280, 30],  # its value
+        ],
+        np.float64,
+    )
+    texts = ["Item", "Value", "a label too long for one column", "42"]
+    html = cells_html([[0], [1], [2], [3]], boxes, texts)
+    assert "<td>42</td>" in html
+
+
 def test_leader_dots_end_no_cell():
     rc = [(0, 0), (0, 1), (1, 0), (1, 1)]
     texts = ["Item", "2024", "Total assets . . .", "12"]

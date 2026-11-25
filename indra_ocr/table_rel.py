@@ -731,6 +731,13 @@ def cells_html(
             grid[key] = (max(prev[0], rs), max(prev[1], c1 - c0 + 1), prev[2] + " " + text)
         else:
             grid[key] = (rs, c1 - c0 + 1, text)
+    # A colspan must not swallow a cell of the same row: the writer skips the
+    # columns a cell spans, so a cell it covers would never be written.
+    for (r, c0), (rs, cs, text) in list(grid.items()):
+        for c in range(c0 + 1, c0 + cs):
+            if (r, c) in grid:
+                grid[(r, c0)] = (rs, c - c0, text)
+                break
     nrows = len(keep)
     covered = np.zeros((nrows, C), bool)
     for (r, c0), (rs, cs, _) in grid.items():
