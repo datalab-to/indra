@@ -21,6 +21,8 @@ SENTENCE_END = ".!?:;。！？：；．"
 
 def display_len(t: str) -> int:
     """Length with East Asian wide characters counted twice."""
+    if t.isascii():  # no ASCII character is wide
+        return len(t)
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in t)
 
 
