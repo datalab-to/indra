@@ -35,7 +35,10 @@ def page_to_input(gray: np.ndarray, long_side: int) -> tuple[np.ndarray, float]:
     ph = math.ceil(nh / INPUT_MULTIPLE) * INPUT_MULTIPLE
     pw = math.ceil(nw / INPUT_MULTIPLE) * INPUT_MULTIPLE
     out = np.zeros((ph, pw), np.float32)  # ink map: 0 = white
-    out[:nh, :nw] = 1.0 - gray.astype(np.float32) / 255.0
+    # 1 - gray / 255 in float32, written in place: no page-sized temporaries
+    ink = out[:nh, :nw]
+    np.divide(gray, np.float32(255.0), out=ink, dtype=np.float32)
+    np.subtract(np.float32(1.0), ink, out=ink)
     return out, scale
 
 
