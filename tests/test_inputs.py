@@ -126,6 +126,19 @@ def test_parallel_plan_has_one_unit_per_page(tmp_path):
     assert usable_cores() >= 1
 
 
+def test_usable_cores_counts_a_core_once(monkeypatch):
+    from indra_ocr import parallel
+
+    if not hasattr(parallel.os, "sched_getaffinity"):
+        pytest.skip("no CPU affinity here")
+    sib = {0: "0,4", 4: "0,4", 1: "1,5", 5: "1,5", 2: "2", 3: None}
+    monkeypatch.setattr(parallel, "_core_cpus", lambda c: sib[c])
+    monkeypatch.setattr(parallel.os, "sched_getaffinity", lambda pid: {0, 4, 1, 5, 2, 3})
+    assert parallel.usable_cores() == 4  # two cores of two threads, one of one, one unknown
+    monkeypatch.setattr(parallel.os, "sched_getaffinity", lambda pid: {0, 1})
+    assert parallel.usable_cores() == 2  # one thread of each of two cores
+
+
 def test_model_errors_are_one_clear_message(tmp_path, monkeypatch, capsys):
     import huggingface_hub
 
