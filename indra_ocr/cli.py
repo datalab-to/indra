@@ -99,7 +99,7 @@ def _main(argv=None):
         dest="cores",
         type=int,
         default=0,
-        help=f"cores to use (default: all this process may run on, here {usable_cores()})",
+        help=f"cores to use (default: the physical cores this process may run on, here {usable_cores()})",
     )
     ap.add_argument("--dpi", type=float, default=200.0)
     ap.add_argument(

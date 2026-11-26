@@ -4,6 +4,11 @@ ONNX Runtime's own threads speed up one page only a little: rendering, the text
 layer and the layout steps run on one core.  Pages are independent, so one
 single-threaded worker process per core uses the cores far better.  pdfium
 is not thread-safe, so the workers are processes, not threads.
+
+A core's hardware threads (SMT, hyper-threading) count as one core.  They
+share the core's caches, and a page on the CPU waits mostly on the caches and
+memory, so a second worker on the same core slows the first by more than it
+adds.
 """
 
 from __future__ import annotations
@@ -22,12 +27,27 @@ _conv = None
 _doc: tuple = (None, None)
 
 
+def _core_cpus(cpu: int) -> str | None:
+    """The CPUs of ``cpu``'s physical core as Linux lists them ("3,35"), or None
+    where the kernel does not say."""
+    for name in ("core_cpus_list", "thread_siblings_list"):
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/{name}") as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return None
+
+
 def usable_cores() -> int:
-    """Cores this process may run on (taskset and cgroup CPU sets count)."""
+    """Physical cores this process may run on: taskset and cgroup CPU sets
+    count, and the hardware threads of one core count once (on Linux; other
+    systems count every CPU)."""
     try:
-        return len(os.sched_getaffinity(0))
+        cpus = os.sched_getaffinity(0)
     except AttributeError:  # macOS, Windows
         return os.cpu_count() or 1
+    return max(1, len({_core_cpus(c) or str(c) for c in cpus}))
 
 
 def _max_workers_for_memory() -> int:
@@ -107,7 +127,7 @@ def convert_many(
     """Yield (path, result) per input, in input order: result is the list of
     (page index, Page) in page order, or the InputError that stopped the file.
 
-    cores: how many cores to use (default: all this process may run on).  The
+    cores: how many cores to use (default: usable_cores()).  The
     pages of all inputs are spread over one worker process per core (fewer when
     physical memory is under WORKER_MEMORY per worker); with fewer than
     MIN_POOL_PAGES pages, one process uses all the cores on each page.

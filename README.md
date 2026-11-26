@@ -121,7 +121,7 @@ indra-ocr paper.pdf --no-math             # skip math recognition and its models
 - `--format [md|text|json]`: output format (default: md)
 - `--mode [auto|ocr|text]`: `auto` reads the text layer where it passes the checks and OCRs elsewhere (default). `ocr` never reads the text layer. `text` uses the text layer even when the checks fail
 - `--no-image-ocr`: on text-layer pages, do not OCR text inside images
-- `--cores N`: cores to use, one worker process each (default: all usable cores)
+- `--cores N`: cores to use, one worker process each (default: all usable cores; on Linux, the hardware threads of one core count once)
 - `--dpi`: render resolution for PDFs (default: 200)
 - `--max-pages N`: read at most N pages per file
 - `--password`: password for encrypted PDFs
@@ -333,7 +333,7 @@ Born-digital splits and old scans, our harness, 200 dpi:
 
 ## Throughput
 
-The CLI and `convert_many` run one single-threaded worker process per usable core, one page per task, so a single long PDF also uses every core. `--cores` limits it.
+The CLI and `convert_many` run one single-threaded worker process per usable core, one page per task, so a single long PDF also uses every core. `--cores` limits it. On Linux a core's hardware threads (SMT) count as one core: they share the core's caches, and a second worker there slows the first by more than it adds.
 
 Pages per second on x86 (AMD EPYC 9004 Genoa, 34 cores, no GPU), on the same 300 OmniParseBench pages, with one single-threaded worker per core, OCR mode and default settings. The other engines ran once on the same machine type and pages.
 
