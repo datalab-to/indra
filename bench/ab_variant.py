@@ -52,9 +52,34 @@ def _variant_recognizer_math():
     return lambda mode: nullcontext()
 
 
+def _variant_decoder_rows():
+    """a: finished lines leave the math decoder's batch by taking the live rows,
+    as in 1.2.0; b: by moving live rows into their places (MathReader.move_rows)."""
+    from contextlib import contextmanager
+
+    from indra_ocr import math
+
+    if not hasattr(math.MathReader, "move_rows"):
+        raise SystemExit("decoder-rows needs MathReader.move_rows")
+
+    @contextmanager
+    def ctx(mode):
+        math.MathReader.move_rows = mode == "b"
+        try:
+            yield
+        finally:
+            math.MathReader.move_rows = True
+
+    return ctx
+
+
 # A variant patches the pipeline once in each worker and returns, for a mode
 # ("a" or "b"), the context the page is read in.
-VARIANTS = {"native": _variant_native, "recognizer-math": _variant_recognizer_math}
+VARIANTS = {
+    "native": _variant_native,
+    "recognizer-math": _variant_recognizer_math,
+    "decoder-rows": _variant_decoder_rows,
+}
 _CTX = None
 
 

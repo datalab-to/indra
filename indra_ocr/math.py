@@ -401,11 +401,19 @@ def gate_features(prob: float, draft: str, n_flagged: int, pmax: float, n_cand: 
     ]
 
 
+def _own(x: np.ndarray) -> np.ndarray:
+    """x, or a copy of it if it cannot be written in place."""
+    return x if x.flags.writeable else x.copy()
+
+
 class MathReader:
     rescore = False  # math_rescore: beam search + draft agreement on unsure lines
     # prose_splice: an accepted whole-line reading keeps the plain reading's prose
     # around its $...$ spans (splice_prose).
     prose_splice = True
+    # move_rows: finished lines leave the decoder's batch by moving live rows into
+    # their places (_front), not by taking the live rows (_take); same tokens.
+    move_rows = True
 
     def __init__(self, onnx_dir: Path, so, providers):
         # The stacked step graph copies the constant cross-attention caches (and
@@ -533,6 +541,19 @@ class MathReader:
         """The cache c for decoder rows ``rows`` (a mask or row indexes)."""
         return [x[rows] for x in c] if self.split_kv else c[:, rows]
 
+    @staticmethod
+    def _front(live: np.ndarray, arrays: list) -> int:
+        """Moves the rows still decoding (``live``, a mask over the first rows) to
+        the front of each array in place -> how many there are.  A finished row
+        in the front takes a live row from the back, so each finished line costs
+        one row's copy, where taking the live rows copies all of them."""
+        n = int(live.sum())
+        dst = np.flatnonzero(~live[:n])
+        src = n + np.flatnonzero(live[n:])
+        for x in arrays:
+            x[dst] = x[src]
+        return n
+
     def _step(self, tok, t: int, sk, sv, ck, cv, mask):
         """One decoder step -> (logits [B, V], self_k, self_v) with this token's
         keys and values appended."""
@@ -573,7 +594,18 @@ class MathReader:
             tok = np.full(B, BOS, np.int64)
             seqs: list[list[int]] = [[] for _ in range(B)]
             probs: list[list[float]] = [[] for _ in range(B)]
-            rows = np.arange(B)  # the batch's lines still decoding, in step order
+            rows = np.arange(B)  # the batch's line in each decoder row
+            # With per-layer caches, finished lines leave the batch by moving live
+            # rows into their places (_front): the step reads the first n rows of
+            # the cross caches and the mask.  A line's outputs do not depend on the
+            # other rows or their order, and each step runs the same lines as
+            # taking the live rows would, so the batch sizes are the same too (a
+            # step of one line is not bitwise one row of a larger step).
+            front = self.split_kv and self.move_rows
+            if front:
+                ck, cv = [_own(x) for x in ck], [_own(x) for x in cv]
+                mask = _own(mask)
+            n = B
             in_math = [False] * B  # inside a $...$ span
             text_like = [False] * B  # the reading already fails accept_math
             # probs as one array: every line still decoding has a probability for
@@ -581,7 +613,11 @@ class MathReader:
             # mean is np.mean of its list, to the bit)
             P = np.zeros((B, self.max_tokens), np.float64)
             for t in range(self.max_tokens - 1):
-                logits, sk, sv = self._step(tok, t, sk, sv, ck, cv, mask)
+                if front:
+                    rk, rv = [x[:n] for x in ck], [x[:n] for x in cv]
+                    logits, sk, sv = self._step(tok, t, sk, sv, rk, rv, mask[:n])
+                else:
+                    logits, sk, sv = self._step(tok, t, sk, sv, ck, cv, mask)
                 tok = logits.argmax(-1).astype(np.int64)
                 e = np.exp(logits - logits.max(-1, keepdims=True))
                 top = 1.0 / e.sum(-1)  # softmax probability of the argmax token
@@ -605,7 +641,12 @@ class MathReader:
                             live[r] = False  # accept_math would reject it: stop here
                 if not live.any():
                     break
-                if not live.all():
+                if not live.all() and front:
+                    sk, sv = [_own(x) for x in sk], [_own(x) for x in sv]
+                    n = self._front(live, [rows, tok, *sk, *sv, *ck, *cv, mask])
+                    rows, tok = rows[:n], tok[:n]
+                    sk, sv = [x[:n] for x in sk], [x[:n] for x in sv]
+                elif not live.all():
                     # Finished lines leave the batch: a step costs about its
                     # number of lines, and the longest line sets the step count.
                     rows, tok, mask = rows[live], tok[live], mask[live]

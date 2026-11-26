@@ -121,3 +121,32 @@ def test_rescore_same_with_per_layer_caches(crops, monkeypatch):
     new = reader(True)._rescore(crops, drafts, batch=8)
     assert old == new
     assert any(t for t, _ in old)
+
+
+def test_front_moves_live_rows_into_finished_rows():
+    live = np.array([False, True, False, True, True])
+    a = np.arange(5) * 10
+    rows = np.arange(16).reshape(8, 2)  # more rows than the step ran: only the first 5 are read
+    n = M.MathReader._front(live, [a, rows])
+    assert n == 3
+    assert a[:n].tolist() == [30, 10, 40]
+    assert rows[:n].tolist() == [[6, 7], [2, 3], [8, 9]]
+    assert rows[5:].tolist() == [[10, 11], [12, 13], [14, 15]]
+
+
+def test_read_moves_rows_and_reads_the_same(crops, monkeypatch):
+    """One batch of all lines, finishing in an order that leaves finished rows in
+    front of live ones: rows move, and the readings are the stacked graph's."""
+    moved = []
+    front = M.MathReader._front
+
+    def spy(live, arrays):
+        moved.append(int((~live[: int(live.sum())]).sum()))
+        return front(live, arrays)
+
+    monkeypatch.setattr(M.MathReader, "_front", staticmethod(spy))
+    boxes = np.zeros((len(WIDTHS), 4), np.float32)
+    old = reader(False).read(np.zeros((8, 8), np.uint8), boxes, batch=len(WIDTHS))
+    new = reader(True).read(np.zeros((8, 8), np.uint8), boxes, batch=len(WIDTHS))
+    assert old == new
+    assert sum(moved) > 0
