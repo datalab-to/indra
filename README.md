@@ -358,7 +358,14 @@ pip install indra-ocr 'omni-parse-bench[benchmark]'
 python bench/opb_indra.py --out runs/opb_auto --mode auto --procs 8
 ```
 
-Each page runs in a single-threaded worker process, page headers and footers kept. `--mode ocr` gives the OCR-only row, `--math` the `--math` row, `--suites` scores only the listed suites, `--limit N` scores the first N pages, and `--models` points at a local model folder. The run writes `summary.json` (the benchmark's own summary, plus median and p90 ms per page) and `pages.jsonl` (per page: time, source, tests passed). The tables above come from our x86 harness, which gives each page 4 threads. This script gives each page one thread, so its times differ, and its scores can differ by a few tenths of a point.
+Each page runs in a single-threaded worker process, page headers and footers kept, math read as LaTeX, as the benchmark's own Indra OCR server reads it; the outputs are mapped by the benchmark's own Indra OCR adapter and graded by its grader (omni-parse-bench 1.8 or newer). `--mode ocr` gives the OCR-only row, `--no-math` the row without math, `--suites` scores only the listed suites (the other pages count as failed), `--limit N` the first N pages, `--models` points at a local model folder, `--pin 0-7` pins worker k to the k-th CPU, and `--device cuda` reads on the GPU. The run writes `predictions/` and the grader's `unit_tests/` folder, `summary.json` (the grade, and mean, median and p90 ms per page by source) and `pages.jsonl` (per page: time, source); `--dump` also writes `outputs.jsonl` (every page's markdown, lines and blocks). The tables above come from our x86 harness, which gives each page 4 threads. This script gives each page one thread, so its times differ, and its scores can differ by a few tenths of a point.
+
+More tools in `bench/`, each with its usage in its docstring:
+
+- `compare_outputs.py RUN_A RUN_B`: two `--dump` runs page by page (identical pages, what differs, `--chars` for the characters changed) and their scores and times.
+- `ab_variant.py --variant ...`: two behaviours of the pipeline read page by page in the same worker, the order alternating, for paired times and outputs (`native`: the native kernels off and on; `pieces`: line models run whole batches or in pieces).
+- `profile_stages.py`: one process, one page at a time; every ONNX model and every pipeline step timed, by page source, on the CPU or the GPU (`--offset`: several processes, each on its own share of the pages, time the models with every core busy).
+- `throughput.py --cores 8 16 32`: pages per second with one single-threaded worker process per core.
 
 # Credits
 

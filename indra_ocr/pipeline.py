@@ -46,7 +46,7 @@ from .rec_preproc import PAD_X, pad_batch, widen, width_batches
 from .rot_gate import read_rotated
 from .rtl import flip, has_rtl, is_rtl
 from .vocab import Vocab
-from .ort_session import session
+from .ort_session import run_pieces, session
 
 ADAPTIVE_MIN_H = (
     9.0  # median line height (input px) that triggers a second detection pass
@@ -844,64 +844,68 @@ class OrtOCR:
                     lm = getattr(self, "lms", {}).get(id(sess))
                     use_lm = lm is not None
                     feed = {"x": arr, "widths": widths}
-                    logits = None
-                    if _has_logits(sess):
-                        best, lengths, logits = sess.run(OUT_LOGITS, feed)
-                    else:
-                        res = sess.run(OUT_GREEDY + (OUT_LM if use_lm else []), feed)
-                        best, pmax, lengths = res[:3]
-                    stride = arr.shape[-1] / max(best.shape[1], 1)
-                    for k, j in enumerate(idx):
-                        n = int(lengths[k])
-                        seq = best[k, :n]
-                        keep = (seq != 0) & np.concatenate(
-                            [[True], seq[1:] != seq[:-1]]
-                        )
-                        if logits is None:
-                            pm = pmax[k, :n][keep]
+                    has_logits = _has_logits(sess)
+                    names = OUT_LOGITS if has_logits else OUT_GREEDY + (OUT_LM if use_lm else [])
+                    # A piece of the batch at a time (ort_session.RowPieces): its
+                    # logits are read while they are in the cache.
+                    for lo, hi, res in run_pieces(sess, names, feed):
+                        logits = None
+                        if has_logits:
+                            best, lengths, logits = res
                         else:
-                            pm = peak_prob(logits[k, :n][keep])
-                        x0, y0, x1, y1 = (float(v) for v in boxes[j, :4])
-                        h = max(1.0, y1 - y0)
-                        ix0 = np.floor(x0 - PAD_X * h)
-                        cw = np.ceil(x1 + PAD_X * h) - ix0
-                        f = cw / (line[j].shape[1] * xscale)
-                        t = np.nonzero(keep)[0]
-                        ids = seq[t].tolist()
-                        conf = float(pm.mean()) if keep.any() else 0.0
-                        if use_lm and MIN_CONF <= conf < lm[3]:
-                            from .lm import beam_search
+                            best, pmax, lengths = res[:3]
+                        stride = arr.shape[-1] / max(best.shape[1], 1)
+                        for k, j in enumerate(idx[lo:hi]):
+                            n = int(lengths[k])
+                            seq = best[k, :n]
+                            keep = (seq != 0) & np.concatenate(
+                                [[True], seq[1:] != seq[:-1]]
+                            )
+                            if logits is None:
+                                pm = pmax[k, :n][keep]
+                            else:
+                                pm = peak_prob(logits[k, :n][keep])
+                            x0, y0, x1, y1 = (float(v) for v in boxes[j, :4])
+                            h = max(1.0, y1 - y0)
+                            ix0 = np.floor(x0 - PAD_X * h)
+                            cw = np.ceil(x1 + PAD_X * h) - ix0
+                            f = cw / (line[j].shape[1] * xscale)
+                            t = np.nonzero(keep)[0]
+                            ids = seq[t].tolist()
+                            conf = float(pm.mean()) if keep.any() else 0.0
+                            if use_lm and MIN_CONF <= conf < lm[3]:
+                                from .lm import beam_search
 
-                            lmin = (
-                                lm_inputs(logits[k, :n], floor=LM_CAND_FLOOR)
-                                if logits is not None
-                                else (res[3][k, :n], res[4][k, :n], res[5][k, :n])
+                                lmin = (
+                                    lm_inputs(logits[k, :n], floor=LM_CAND_FLOOR)
+                                    if logits is not None
+                                    else (res[3][k, :n], res[4][k, :n], res[5][k, :n])
+                                )
+                                ids, steps = beam_search(
+                                    *lmin,
+                                    lm[0],
+                                    lm[1],
+                                    lm[2],
+                                    LM_BEAM,
+                                    cand_floor=LM_CAND_FLOOR,
+                                )
+                                t = np.array(steps, np.int64)
+                            xs = (ix0 + (t + 0.5) * stride * f).tolist()
+                            # A group recognizer's ids mean nothing in self.vocab: its
+                            # tokens are characters, like the text-layer tokens.
+                            toks = (
+                                list(zip([vocab.chars[i - 1] for i in ids], xs))
+                                if as_chars
+                                else list(zip(ids, xs))
                             )
-                            ids, steps = beam_search(
-                                *lmin,
-                                lm[0],
-                                lm[1],
-                                lm[2],
-                                LM_BEAM,
-                                cand_floor=LM_CAND_FLOOR,
+                            if conf <= best_conf[j] and not force:
+                                continue
+                            best_conf[j] = conf
+                            out[j] = (
+                                (vocab.decode(ids), conf, toks)
+                                if conf >= MIN_CONF
+                                else ("", conf, [])
                             )
-                            t = np.array(steps, np.int64)
-                        xs = (ix0 + (t + 0.5) * stride * f).tolist()
-                        # A group recognizer's ids mean nothing in self.vocab: its
-                        # tokens are characters, like the text-layer tokens.
-                        toks = (
-                            list(zip([vocab.chars[i - 1] for i in ids], xs))
-                            if as_chars
-                            else list(zip(ids, xs))
-                        )
-                        if conf <= best_conf[j] and not force:
-                            continue
-                        best_conf[j] = conf
-                        out[j] = (
-                            (vocab.decode(ids), conf, toks)
-                            if conf >= MIN_CONF
-                            else ("", conf, [])
-                        )
 
         read(groups)
         if rec_hw is not None and gate is not None and not vertical and crops:
@@ -1000,13 +1004,24 @@ class OrtOCR:
             return []
         pool = getattr(self, "pool", None)
         window = getattr(self, "window", 1)
-        dark = line_darkness(gray, boxes[:, :4], pool) if window > 1 else None
-        crops = crop_lines(gray, boxes[:, :4], self.height, self.mask, pool=pool, dark=dark)
-        tall = (
-            crop_lines(gray, boxes[:, :4], self.height, window=window, pool=pool, dark=dark)
-            if window > 1
-            else crops
-        )
+        # The symbol-digit fix asks about each box two or more times (the layer's
+        # text and each alternative): a box is cut once, and its crops are the same
+        # objects in every place it comes, so the classifier and each recognizer
+        # read it once (the batches keep their lines and padded width, so a line
+        # reads the same).  With CenterMask (mask.onnx), which reads the boxes of a
+        # page as one batch, every box is cut as before.
+        rep = list(range(len(boxes)))
+        if getattr(self, "mask", None) is None:
+            first: dict = {}
+            rep = [first.setdefault(tuple(float(v) for v in b[:4]), j) for j, b in enumerate(boxes)]
+        uniq = sorted(set(rep))
+        ub = boxes[uniq, :4]
+        dark = line_darkness(gray, ub, pool) if window > 1 else None
+        uc = crop_lines(gray, ub, self.height, self.mask, pool=pool, dark=dark)
+        ut = crop_lines(gray, ub, self.height, window=window, pool=pool, dark=dark) if window > 1 else uc
+        at = {j: i for i, j in enumerate(uniq)}
+        crops = [uc[at[r]] for r in rep]
+        tall = [ut[at[r]] for r in rep]
         recs = {"base": (self.rec, self.vocab), **self.groups}
         if self.script is not None:
             names, sure = self.line_groups(crops)
@@ -1024,28 +1039,40 @@ class OrtOCR:
             if not sel:
                 continue
             xscale = getattr(self, "xscale", {}).get(id(sess), 1.0)
-            arr, widths = pad_batch(
-                widen([(tall if sess is self.rec else crops)[j] for j in sel], xscale)
-            )
-            if any(o.name == "logits" for o in sess.get_outputs()):
-                best, lengths, logits = sess.run(["ids", "lengths", "logits"], {"x": arr, "widths": widths})
-                blank, topv, topi = _top_k(logits, int(lengths.max()))
-            else:
-                best, _, lengths, blank, topv, topi = sess.run(
-                    OUT_GREEDY + OUT_LM, {"x": arr, "widths": widths}
-                )
+            src = tall if sess is self.rec else crops
+            first = {}
+            for j in sel:
+                first.setdefault(id(src[j]), j)
+            uniq = list(first.values())  # one row per crop
+            row = {id(src[j]): k for k, j in enumerate(uniq)}
+            arr, widths = pad_batch(widen([src[j] for j in uniq], xscale))
+            has_logits = any(o.name == "logits" for o in sess.get_outputs())
+            reads: list = [None] * len(uniq)  # per row: (ids, blank, topv, topi) of its frames
+            # A piece of the batch at a time (ort_session.RowPieces): the top-k of a
+            # piece's logits is taken while they are in the cache.
+            for lo, hi, res in run_pieces(
+                sess, ["ids", "lengths", "logits"] if has_logits else OUT_GREEDY + OUT_LM,
+                {"x": arr, "widths": widths},
+            ):
+                if has_logits:
+                    best, lengths, logits = res
+                    blank, topv, topi = _top_k(logits, int(lengths.max()))
+                else:
+                    best, _, lengths, blank, topv, topi = res
+                for k in range(hi - lo):
+                    n = int(lengths[k])
+                    reads[lo + k] = (best[k, :n], blank[k, :n], topv[k, :n], topi[k, :n])
             dollar = vocab.index.get("$")  # a math span opens: the reading is LaTeX
-            for k, j in enumerate(sel):
-                n = int(lengths[k])
-                if dollar is not None and (best[k, :n] == dollar).any():
+            for j in sel:
+                seq, bl, tv, ti = reads[row[id(src[j])]]
+                if dollar is not None and (seq == dollar).any():
                     math_lines.add(j)
                     continue
                 ids = target_ids(texts[name][j], vocab, visual=name == "rtl")
-                seq = best[k, :n]
                 keep = (seq != 0) & np.concatenate([[True], seq[1:] != seq[:-1]])
-                peak = np.exp(np.maximum(blank[k, :n], topv[k, :n, 0]))
+                peak = np.exp(np.maximum(bl, tv[:, 0]))
                 conf = float(peak[keep].mean()) if keep.any() else 0.0
-                todo.append((j, conf, name, (blank[k, :n], topv[k, :n], topi[k, :n], ids)))
+                todo.append((j, conf, name, (bl, tv, ti, ids)))
         out: list[tuple[float | None, float, str]] = [(float("inf"), 0.0, g) for g in names]
         for (j, conf, name, _), g in zip(todo, forced_gaps([it for *_, it in todo])):
             if g < out[j][0]:
@@ -1079,9 +1106,17 @@ class OrtOCR:
         out = ["base"] * len(crops)
         sure = [True] * len(crops)
         for idx in width_batches([c.shape[1] for c in crops], batch):
-            arr, widths = pad_batch([crops[j] for j in idx])
+            # A crop listed more than once (layer_gaps) is classified once; the
+            # batch keeps its lines and padded width.
+            first: dict = {}
+            for j in idx:
+                first.setdefault(id(crops[j]), j)
+            uniq = list(first.values())
+            row = {id(crops[j]): k for k, j in enumerate(uniq)}
+            arr, widths = pad_batch([crops[j] for j in uniq])
             p = self.script.run(None, {"x": arr, "widths": widths})[0]
-            for k, j in enumerate(idx):
+            for j in idx:
+                k = row[id(crops[j])]
                 names = getattr(self, "script_groups", GROUPS)
                 pk_row = p[k]
                 if p.ndim > 1 and "hw" in names:
